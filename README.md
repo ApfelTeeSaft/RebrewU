@@ -1,5 +1,7 @@
 # RebrewU - WiiU PowerPC Static Recompiler
 
+# - IMPORTANT: Current State is, unusable, this is planned to work with Splatoon, but at this current stage we are missing a lot of Implementations, so please help out :)
+
 RebrewU is a static recompiler that converts WiiU RPX executables into C++ code, which can then be recompiled for any platform. This project is designed specifically for the WiiU's PowerPC architecture and handles the unique aspects of the WiiU system, including paired single floating-point instructions and RPX file format.
 
 **DISCLAIMER:** This project only converts the game code to C++. It does not provide a runtime implementation. Making the game work requires implementing the necessary runtime environment, including WiiU system calls, hardware abstractions, and library functions.
