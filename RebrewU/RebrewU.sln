@@ -1,0 +1,38 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RebrewUtils", "RebrewUtils\RebrewUtils.vcxproj", "{B12702AD-ABFB-343A-A199-8E24837244A3}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RebrewAnalyse", "RebrewAnalyse\RebrewAnalyse.vcxproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
+	ProjectDependencies = {B12702AD-ABFB-343A-A199-8E24837244A3}
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RebrewRecomp", "RebrewRecomp\RebrewRecomp.vcxproj", "{F1E2D3C4-B5A6-9870-FEDC-BA0987654321}"
+	ProjectDependencies = {B12702AD-ABFB-343A-A199-8E24837244A3} = {B12702AD-ABFB-343A-A199-8E24837244A3}
+	ProjectDependencies = {A1B2C3D4-E5F6-7890-ABCD-EF1234567890} = {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+EndProject
+
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B12702AD-ABFB-343A-A199-8E24837244A3}.Debug|x64.ActiveCfg = Debug|x64
+		{B12702AD-ABFB-343A-A199-8E24837244A3}.Debug|x64.Build.0 = Debug|x64
+		{B12702AD-ABFB-343A-A199-8E24837244A3}.Release|x64.ActiveCfg = Release|x64
+		{B12702AD-ABFB-343A-A199-8E24837244A3}.Release|x64.Build.0 = Release|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|x64.ActiveCfg = Debug|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|x64.Build.0 = Debug|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|x64.ActiveCfg = Release|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|x64.Build.0 = Release|x64
+		{F1E2D3C4-B5A6-9870-FEDC-BA0987654321}.Debug|x64.ActiveCfg = Debug|x64
+		{F1E2D3C4-B5A6-9870-FEDC-BA0987654321}.Debug|x64.Build.0 = Debug|x64
+		{F1E2D3C4-B5A6-9870-FEDC-BA0987654321}.Release|x64.ActiveCfg = Release|x64
+		{F1E2D3C4-B5A6-9870-FEDC-BA0987654321}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

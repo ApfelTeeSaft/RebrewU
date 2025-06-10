@@ -1,0 +1,111 @@
+# RebrewU Sample Configuration File
+# This is a template configuration for recompiling WiiU RPX files
+
+[main]
+# Path to the RPX file to recompile (relative to this config file)
+file_path = "game.rpx"
+
+# Output directory for generated C++ files (must exist)
+out_directory_path = "recompiled"
+
+# Optional: Jump table definitions file
+switch_table_file_path = "jump_tables.toml"
+
+# WiiU Memory Layout Configuration
+# MEM1 - Main system memory
+mem1_base = 0x00800000
+mem1_size = 0x01800000
+
+# MEM2 - Extended memory  
+mem2_base = 0x10000000
+mem2_size = 0x20000000
+
+# Optimization Settings (recommended to leave false until working)
+skip_lr = false                        # Skip link register operations
+skip_msr = false                       # Skip machine state register
+ctr_as_local = false                   # Count register as local variable
+xer_as_local = false                   # XER register as local variable
+reserved_as_local = false              # Reserved register as local variable
+cr_as_local = false                    # Condition registers as local variables
+non_argument_as_local = false          # Non-argument registers as local variables
+non_volatile_as_local = false          # Non-volatile registers as local variables
+
+# WiiU-Specific Code Generation
+generate_paired_single_support = true  # Enable paired single instructions
+generate_gqr_support = true            # Enable Graphics Quantization Register support
+optimize_for_wiiu_hardware = true      # Use WiiU-specific optimizations
+enable_cache_optimizations = false     # Enable cache-friendly code generation
+
+# Advanced Settings
+treat_unknown_instructions_as_nop = false  # Treat unknown instructions as no-ops
+generate_debug_info = false              # Generate debugging information
+max_function_size = 0x10000              # Maximum function size (64KB)
+
+# System Function Addresses (MUST BE FOUND THROUGH REVERSE ENGINEERING)
+# These addresses are game-specific and must be located manually
+# Use a disassembler or debugger to find these functions
+
+# Register save/restore functions (required)
+restgprlr_14_address = 0x00000000      # __restgprlr_14 function address
+savegprlr_14_address = 0x00000000      # __savegprlr_14 function address
+restfpr_14_address = 0x00000000        # __restfpr_14 function address  
+savefpr_14_address = 0x00000000        # __savefpr_14 function address
+restvmx_14_address = 0x00000000        # __restvmx_14 function address
+savevmx_14_address = 0x00000000        # __savevmx_14 function address
+restvmx_64_address = 0x00000000        # __restvmx_64 function address (if present)
+savevmx_64_address = 0x00000000        # __savevmx_64 function address (if present)
+
+# Exception handling functions (optional)
+longjmp_address = 0x00000000           # longjmp function address
+setjmp_address = 0x00000000            # setjmp function address
+
+# Graphics Quantization Register functions (WiiU-specific, optional)
+# These handle paired single load/store with quantization
+gqr_0_load_address = 0x00000000        # GQR0 load function
+gqr_0_store_address = 0x00000000       # GQR0 store function
+gqr_1_load_address = 0x00000000        # GQR1 load function
+gqr_1_store_address = 0x00000000       # GQR1 store function
+# ... continue for GQR2-GQR7 as needed
+
+# Manual Function Definitions
+# Use this section to manually define function boundaries if analysis fails
+[[functions]]
+address = 0x02000000
+size = 0x100
+
+[[functions]]
+address = 0x02001000  
+size = 0x200
+
+# Invalid Instruction Patterns
+# Define patterns to skip during recompilation (e.g., padding, exception data)
+[[invalid_instructions]]
+data = 0x00000000     # NULL padding
+size = 4
+
+[[invalid_instructions]]
+data = 0x60000000     # NOP instruction
+size = 4
+
+# Mid-Assembly Hooks
+# Insert custom function calls at specific addresses
+[[midasm_hook]]
+name = "CustomMemoryHook"
+address = 0x02002000
+registers = ["r3", "r4", "r5"]
+# Optional: return = true
+# Optional: jump_address = 0x02003000
+
+[[midasm_hook]] 
+name = "PairedSingleHook"
+address = 0x02004000
+registers = ["f0", "f1", "gqr0"]
+after_instruction = true
+
+# Example of conditional hook
+[[midasm_hook]]
+name = "ConditionalHook" 
+address = 0x02005000
+registers = ["r3"]
+return_on_true = true
+# This hook returns from the function if it returns true
