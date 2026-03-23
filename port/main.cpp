@@ -132,6 +132,36 @@ int main(int argc, char** argv) {
     // Register all recompiled game functions so rbrew_dispatch can find them
     Gambit_game_register(&cpu_reg);
 
+    // Override fn_02817C50 (0x02817C50): GHS fiber "wait for first frame" loop.
+    //
+    // Called as vtable[45] from fn_02818CAC during Gambit__start.
+    // It loops at L_02817CAC calling render-update helpers (fn_0281DFD8 etc.)
+    // until a fiber-done flag (fiber_obj+0xB4) becomes non-zero.  On Wii U
+    // the fiber scheduler running on a second core sets that flag after the
+    // first render fiber completes.  In our single-threaded port the flag is
+    // never set (arena is zeroed), so the loop runs forever.
+    //
+    // Call chain: Gambit__start → fn_02797FB4 → fn_02813F44 (vtable[9])
+    //             → fn_02818CAC (vtable[23]) → fn_02817C50 (vtable[45])
+    //
+    // fn_02818190 (which writes the render context to 0x101C98A8) runs inside
+    // fn_02797FB4 *before* vtable[9] is called, so the render context is
+    // already valid when we short-circuit here.
+    rbrew_register_func(&cpu_reg, 0x02817C50u, [](CPUState*) {});
+
+    // Override fn_02818D40 and fn_02818D44 (0x02818D40 / 0x02818D44):
+    // GHS fiber scheduler dispatch loops.  On Wii U these run forever calling
+    // vtable[0xCC] (fn_02796E04) to schedule the next fiber frame.  In our
+    // single-threaded port we drive the game loop directly from main(), so we
+    // return immediately here.  These are reached via:
+    //   Gambit__start → fn_02797FB4 → fn_02813F44 (vtable[9])
+    //                 → fn_02818CAC (vtable[23]) → fn_02818D40 (vtable[49])
+    // fn_02818190 (which writes the render context to 0x101C98A8) runs inside
+    // fn_02797FB4 *before* the vtable chain above, so the context is already
+    // set up when we return here and Gambit__start completes normally.
+    rbrew_register_func(&cpu_reg, 0x02818D40u, [](CPUState*) {});
+    rbrew_register_func(&cpu_reg, 0x02818D44u, [](CPUState*) {});
+
     // Override fn_02C8706C (0x02C8706C): the GHS vsync-wait frame-sync function.
     //
     // On Wii U this raises GHS signal 6 which longjmps into the fiber scheduler,
