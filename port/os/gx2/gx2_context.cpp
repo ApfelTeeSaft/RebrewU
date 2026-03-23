@@ -88,8 +88,16 @@ static bool gx2_platform_open_window() {
     SDL_GL_MakeCurrent(s_window, s_glctx);
     SDL_GL_SetSwapInterval(1); // vsync
 
-    // Start in TV view with mouse captured for camera control
+    // Start in TV view with mouse captured for camera control.
+    // Raise the window first so it has focus, then flush any spurious events
+    // (e.g. SDL_QUIT) that SDL may have queued during window creation or
+    // SDL_SetRelativeMouseMode before the window was visible.
+    SDL_RaiseWindow(s_window);
+    SDL_PumpEvents();
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
     SDL_SetRelativeMouseMode(SDL_TRUE);
+    SDL_PumpEvents();
+    SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
     g_screen_mode = ScreenMode::TV;
 
     // Initialise the GL 3.x+ rendering back-end now that the context exists
