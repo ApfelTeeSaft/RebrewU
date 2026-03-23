@@ -1,5 +1,10 @@
 // GX2 context and initialization
 // GX2Init, GX2Shutdown, GX2SetContextState, GX2DrawDone, swap chain
+//
+// Opens an SDL2 window with an OpenGL 4.1 core context.
+// TV / GamePad view toggle with simulated touch input.
+// gx2_render_init() loads GL functions + stub shader after context creation;
+// GX2SwapScanBuffers blits the game FBO to the window.
 
 #include "../os_common.h"
 #include "../../runtime/screen_mode.h"
@@ -10,7 +15,7 @@
 ScreenMode g_screen_mode  = ScreenMode::TV;
 TouchState g_touch_state  = { false, 0, 0 };
 
-// SDL2 and OpenGL are optional
+// SDL2 and OpenGL are optional at this phase — compile to stubs if not available
 #if defined(HAVE_SDL2)
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
@@ -159,6 +164,9 @@ static void GX2CopyColorBufferToScanBuffer(CPUState* cpu) {
 // Called every frame — pump SDL events, blit game FBO to window, swap buffers.
 static void GX2SwapScanBuffers(CPUState* cpu) {
 #if defined(HAVE_SDL2)
+    static uint32_t s_swap_count = 0;
+    if (++s_swap_count == 1)
+        fprintf(stderr, "[gx2] GX2SwapScanBuffers called for the first time\n");
     if (s_window) {
         // Pump SDL events first
         SDL_Event ev;

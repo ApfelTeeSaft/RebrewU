@@ -1,7 +1,7 @@
 // gx2_render.cpp — OpenGL back-end for GX2
 //
 // Implements FBO management, texture upload, raster state, and scan-buffer
-// blitting.  All draw calls are still stubs.
+// blitting.
 //
 // GL 3.x functions are loaded dynamically via SDL_GL_GetProcAddress to avoid
 // any dependency on GLEW / GLAD.
@@ -226,7 +226,7 @@ static GLuint s_dummy_vao      = 0;   // VAO required in core profile
 static GLuint s_stub_program   = 0;   // minimal GLSL program (avoids draw errors)
 
 // ---------------------------------------------------------------------------
-// fetch-shader side-table + attrib buffer state
+// Fetch-shader side-table + attrib buffer state
 // ---------------------------------------------------------------------------
 struct FetchShaderInfo {
     uint32_t attrib_count       = 0;
@@ -247,7 +247,7 @@ static GLuint   s_draw_vao    = 0; // single persistent VAO for game draw calls
 static GLuint   s_draw_ebo    = 0; // persistent EBO for indexed draws
 
 // ---------------------------------------------------------------------------
-// shader program cache + UBO state
+// Shader program cache + UBO state
 // ---------------------------------------------------------------------------
 // UBO constants: 256 × vec4 = 4096 bytes per stage
 static constexpr uint32_t UBO_VEC4_COUNT = 256u;
@@ -324,6 +324,9 @@ static GLFmtInfo gx2_gl_format(uint32_t gx2_fmt) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stub shader (renders nothing but prevents GL errors)
+// ---------------------------------------------------------------------------
 static const char* STUB_VERT_SRC =
     "#version 410 core\n"
     "void main() { gl_Position = vec4(0.0, 0.0, -2.0, 1.0); }\n"; // behind clip plane
@@ -476,7 +479,7 @@ void gx2_render_init() {
         if (s_UseProg) s_UseProg(s_stub_program);
     }
 
-    // allocate UBOs for VS and PS constant banks
+    // Allocate UBOs for VS and PS constant banks
     if (s_GenBuffers && s_BindBufBase && s_BufSubData) {
         memset(s_vs_constants, 0, sizeof(s_vs_constants));
         memset(s_ps_constants, 0, sizeof(s_ps_constants));
@@ -508,6 +511,7 @@ void gx2_render_init() {
 }
 
 void gx2_render_set_color_buffer(uint32_t cb_addr, uint8_t* mem) {
+    fprintf(stderr, "[gx2_render] GX2SetColorBuffer cb=0x%08X\n", cb_addr);
     if (!cb_addr || !s_GenFBO) return;
 
     auto it = s_cb_map.find(cb_addr);
@@ -731,6 +735,8 @@ void gx2_render_bind_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem) {
 
 void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target,
                               uint8_t* mem) {
+    fprintf(stderr, "[gx2_render] GX2CopyColorBufferToScanBuffer cb=0x%08X target=%u fbo_map_size=%zu\n",
+            cb_addr, scan_target, s_cb_map.size());
     auto it = s_cb_map.find(cb_addr);
     if (it == s_cb_map.end()) return;
 
@@ -771,7 +777,7 @@ void gx2_render_present(void* sdl_window, bool gamepad_mode) {
 }
 
 // ---------------------------------------------------------------------------
-// primitive type conversion
+// Primitive type conversion
 // ---------------------------------------------------------------------------
 // GX2PrimitiveMode enum values (AMD R600-derived):
 //   0x01 POINTS, 0x02 LINES, 0x03 LINE_STRIP, 0x04 TRIANGLES,
@@ -786,7 +792,7 @@ static GLenum gx2_prim_to_gl(uint32_t prim) {
     case 0x04: return GL_TRIANGLES;
     case 0x05: return GL_TRIANGLE_FAN;
     case 0x06: return GL_TRIANGLE_STRIP;
-    // RECTS / QUADS / QUAD_STRIP — approximate
+    // RECTS / QUADS / QUAD_STRIP — approximate; proper conversion
     case 0x11:
     case 0x13:
     case 0x14: return GL_TRIANGLES;
@@ -897,9 +903,13 @@ static bool gx2_setup_vertex_attribs(uint8_t* mem) {
     return true;
 }
 
+// Forward declarations for helpers used by draw functions
 static GLuint resolve_active_program(uint8_t* mem);
 static void   bind_ubos_to_program(GLuint prog);
 
+// ---------------------------------------------------------------------------
+// Public API implementations
+// ---------------------------------------------------------------------------
 
 void gx2_render_save_fetch_shader(uint32_t fs_addr,
                                   uint32_t attrib_count,
@@ -986,6 +996,9 @@ void gx2_render_draw_indexed(uint32_t prim_type,
     if (s_BindVAO && s_dummy_vao) s_BindVAO(s_dummy_vao);
 }
 
+// ---------------------------------------------------------------------------
+// Helper — compile and link one translated GLSL program
+// ---------------------------------------------------------------------------
 static GLuint compile_translated_program(const char* vs_src, const char* ps_src) {
     if (!s_CreateShader || !s_CreateProg) return 0;
 
@@ -1026,6 +1039,9 @@ static void bind_ubos_to_program(GLuint prog) {
     (void)s_UBB;
 }
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 void gx2_render_set_vertex_shader(uint32_t vs_addr, uint8_t* mem) {
     if (!vs_addr) return;

@@ -134,13 +134,31 @@ int main(int argc, char** argv) {
 
     // Override fn_02C8706C (0x02C8706C): the GHS vsync-wait frame-sync function.
     //
-    // On Wii U this function calls GHS raise(6) (vsync signal), whose one-shot
-    // handler does a longjmp into the GHS fiber scheduler so fn_02C8706C never
-    // returns through its normal C path.  There is no vsync ISR in our
-    // single-threaded PC port, so we replace the whole body with a simple ~60 fps
-    // frame pacer.
+    // On Wii U this raises GHS signal 6 which longjmps into the fiber scheduler,
+    // switching execution to the render fiber (fn_028194E4).  The render fiber
+    // calls the game's render callback (GX2SetColorBuffer + all draw calls),
+    // GX2CopyColorBufferToScanBuffer, and GX2SwapScanBuffers, then yields back.
+    //
+    // In our single-threaded port we simulate this round-trip by:
+    //   1. Reading the render context pointer from 0x101C98A8
+    //      (written there by fn_02818190 during Gambit__start below).
+    //   2. Directly calling fn_028194E4 (render fiber per-frame) with that ctx.
+    //      fn_028194E4 invokes the render callback and, if ctx+0x28==2,
+    //      calls GX2SwapScanBuffers (pumps SDL events + swaps the GL buffer).
+    //   3. Unconditionally calling GX2SwapScanBuffers afterwards to guarantee
+    //      event pumping and buffer swap even if ctx+0x28 is not yet 2.
     rbrew_register_func(&cpu_reg, 0x02C8706Cu,
-                        [](CPUState*) { platform_sleep_us(16667); });
+                        [](CPUState* cpu) {
+                            uint32_t render_ctx = rbrew_read32(cpu->mem, 0x101C98A8u);
+                            if (render_ctx != 0) {
+                                // Run render fiber: calls render callback, copy-to-scan,
+                                // and (conditionally) GX2SwapScanBuffers.
+                                cpu->r[3] = render_ctx;
+                                rbrew_dispatch(cpu, 0x028194E4u); // fn_028194E4
+                            }
+                            // Always swap to pump SDL events and present the frame.
+                            rbrew_dispatch(cpu, 0x02D062F8u); // GX2SwapScanBuffers
+                        });
 
     fprintf(stderr, "[gambit] OS modules registered\n");
 
@@ -309,6 +327,33 @@ int main(int argc, char** argv) {
     // L_02C83138 (the real function body), not at L_02C83190 (the loop-back
     // entry that sets r3=0xD).  Pre-set r3=0xD here to match what L_02C83190
     // would have done before branching to the body.
+
+    // 7e. Run the game's own _start (Gambit__start @ 0x02C6BCA4).
+    //
+    // On Wii U the GHS scheduler calls this after fn_02000020 returns.  It runs
+    // the render-system initialisation chain:
+    //   Gambit__start → fn_027962E8 → fn_02797FB4 → fn_02818190
+    // fn_02818190 calls GX2Init (opens the SDL window), allocates the render
+    // context struct (0x160 bytes), sets up framebuffers and shader state, and
+    // stores the render context pointer at 0x101C98A8.  The fn_02C8706C override
+    // above reads that pointer every frame to drive fn_028194E4 (render fiber).
+    //
+    // r3=0, r4=0 are safe: fn_027962E8 stores them as "parent object" pointers
+    // at 0x101CB240/244 but fn_02797FB4 (the actual renderer init) ignores them.
+    cpu.r[3] = 0u;
+    cpu.r[4] = 0u;
+    rbrew_dispatch(&cpu, 0x02C6BCA4u); // Gambit__start
+    {
+        uint32_t render_ctx = rbrew_read32(arena, 0x101C98A8u);
+        fprintf(stderr, "[gambit] Gambit__start done; render_ctx=0x%08X\n", render_ctx);
+    }
+
+    // 7f. Ensure the SDL window and GL context exist (Gambit__start calls GX2Init
+    //     internally via fn_02818190; this is a no-op if the window is already open).
+    cpu.r[3] = 0u; // attribs = NULL
+    rbrew_dispatch(&cpu, 0x02D05B78u); // GX2Init (idempotent)
+    fprintf(stderr, "[gambit] GX2 init confirmed\n");
+
     cpu.r[3] = 0x0000000Du; // mimic L_02C83190: li r3, 0xD
     fprintf(stderr, "[gambit] ctx=0x%08X — entering game main loop (fn_02C83190)\n",
             game_ctx);
