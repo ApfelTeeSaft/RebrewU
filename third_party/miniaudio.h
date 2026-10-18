@@ -1184,7 +1184,7 @@ outside of the outer cone, the attenuation will be set to `outerGain` in the exa
 the sound is in between the inner and outer cones, the attenuation will be interpolated between 1
 and the outer gain.
 
-The engine's coordinate system follows the OpenGL coordinate system where positive X points right,
+The engine's coordinate system follows the right-handed coordinate system where positive X points right,
 positive Y points up and negative Z points forward.
 
 The simplest and least flexible way to play a sound is like so:
@@ -52296,7 +52296,7 @@ static float ma_calculate_angular_gain(ma_vec3f dirA, ma_vec3f dirB, float coneI
     Unlike distance gain, the math for this is not specified by the OpenAL spec so we'll just go ahead and figure
     this out for ourselves at the expense of possibly being inconsistent with other implementations.
 
-    To do cone attenuation, I'm just using the same math that we'd use to implement a basic spotlight in OpenGL. We
+    To do cone attenuation, I'm just using the same math that we'd use to implement a basic spotlight. We
     just need to get the direction from the source to the listener and then do a dot product against that and the
     direction of the spotlight. Then we just compare that dot product against the cosine of the inner and outer
     angles. If the dot product is greater than the outer angle, we just use coneOuterGain. If it's less than
@@ -52444,7 +52444,7 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
         Unlike distance gain, the math for this is not specified by the OpenAL spec so we'll just go ahead and figure
         this out for ourselves at the expense of possibly being inconsistent with other implementations.
 
-        To do cone attenuation, I'm just using the same math that we'd use to implement a basic spotlight in OpenGL. We
+        To do cone attenuation, I'm just using the same math that we'd use to implement a basic spotlight. We
         just need to get the direction from the source to the listener and then do a dot product against that and the
         direction of the spotlight. Then we just compare that dot product against the cosine of the inner and outer
         angles. If the dot product is greater than the outer angle, we just use coneOuterGain. If it's less than

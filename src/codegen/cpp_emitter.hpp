@@ -13,6 +13,7 @@ namespace rebrewu::codegen {
     bool emit_guest_addr_labels{true};  // label every guest instruction
     bool verbose{false};
     bool emit_data_sections{true};
+    bool emit_ppc_image{false};         // independent original-code fallback image
     bool use_goto{true};               // use goto for block jumps (vs setjmp)
     uint32_t functions_per_file{500};  // 0 = all in one file
     std::string runtime_header{"rebrewu_runtime.h"};
@@ -45,6 +46,7 @@ namespace rebrewu::codegen {
 
   private:
     void emit_file_prologue(std::ostream& out);
+    bool emit_ppc_image(const std::filesystem::path& outdir);
     void emit_block(const ir::BasicBlock& block, const ir::IRFunction& func, std::ostream& out, int indent);
     void emit_instr(const ir::IRInstr& instr, std::ostream& out, int indent);
     std::string format_operand(const ir::IROperand& op) const;

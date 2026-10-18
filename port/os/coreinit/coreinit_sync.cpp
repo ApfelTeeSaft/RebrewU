@@ -46,7 +46,7 @@ static void OSTryLockMutex(CPUState* cpu) { RET = get_mutex(ARG0)->m.try_lock() 
 // OSFastMutex — same backing as OSMutex
 static void OSFastMutex_Init(CPUState* cpu)    {
     get_mutex(ARG0);
-    if (ARG0 && (uint64_t)ARG0 + 0x20u < WIIU_MEM_SIZE)
+    if (ARG0 && rbrew_memory_accessible(MEM,ARG0,0x20u))
         memset(MEM + ARG0, 0, 0x20);
 }
 static void OSFastMutex_Lock(CPUState* cpu)    { get_mutex(ARG0)->m.lock(); }
@@ -73,8 +73,18 @@ static CondImpl* get_cond(uint32_t ptr) {
 }
 
 static void OSInitCond(CPUState* cpu)  { get_cond(ARG0); }
-static void OSSignalCond(CPUState* cpu){ get_cond(ARG0)->cv.notify_one(); }
-static void OSBroadcastCond(CPUState* cpu){ get_cond(ARG0)->cv.notify_all(); }
+// Taking the CV lock orders a signal after a waiter that already released the
+// guest mutex has started waiting; without it that wakeup could be lost.
+static void OSSignalCond(CPUState* cpu){
+    CondImpl* cd = get_cond(ARG0);
+    { std::lock_guard<std::mutex> lk(cd->mtx); }
+    cd->cv.notify_one();
+}
+static void OSBroadcastCond(CPUState* cpu){
+    CondImpl* cd = get_cond(ARG0);
+    { std::lock_guard<std::mutex> lk(cd->mtx); }
+    cd->cv.notify_all();
+}
 
 // OSWaitCond(cond, mutex)
 // The game calls this while holding OSMutex (ARG1).  We must unlock it,
@@ -90,6 +100,7 @@ static void OSWaitCond(CPUState* cpu) {
     std::unique_lock<std::mutex> lk(cd->mtx);
     md->m.unlock();
     cd->cv.wait(lk);
+    lk.unlock(); // a signaler may hold the guest mutex while taking cd->mtx
     md->m.lock();
 }
 

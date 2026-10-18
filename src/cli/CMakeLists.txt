@@ -1,6 +1,7 @@
 add_executable(rebrewu
     main.cpp
     cli_options.cpp
+    audit.cpp
 )
 
 target_include_directories(rebrewu
@@ -16,6 +17,7 @@ target_link_libraries(rebrewu
         rebrewu_ir
         rebrewu_analysis
         rebrewu_codegen
+        nlohmann_json
         rebrewu_config
         rebrewu_diagnostics
 )

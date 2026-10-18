@@ -21,6 +21,9 @@ struct IRFunction {
 
     std::deque<BasicBlock>          blocks{};  // deque preserves refs/ptrs on push_back
     std::unordered_map<uint32_t,uint32_t> addr_to_block{}; // guest addr -> block id
+    // BCTR guest PC -> verified local inline branch-table entry addresses.
+    // These are blocks within the active frame, not callable function entries.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> indirect_jump_targets{};
 
     uint32_t next_temp_id{0};
     uint32_t next_block_id{0};

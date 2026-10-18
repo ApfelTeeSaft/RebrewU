@@ -2,261 +2,53 @@
 // nn_save, nn_act, nn_olv, nn_boss, nn_nfp, nn_fp, proc_ui, sysapp,
 // nsysnet, zlib125, nlibcurl, mic, nn_ac, nn_acp, nn_ndm
 //
-// nn_save is fully implemented: save files are stored under ./save/
+// nn_save file operations use the shared coreinit FS provider under ./save/.
 
 #include "../os_common.h"
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
-#ifdef _WIN32
-#  include <direct.h>
-#  include <io.h>
-#  define PATH_SEP '\\'
-// Recursive mkdir helper (Windows)
-static int mkdirs(const char* path) {
-    char buf[512];
-    strncpy(buf, path, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
-    for (char* p = buf+1; *p; p++) {
-        if (*p == '\\' || *p == '/') {
-            char c = *p; *p = '\0';
-            _mkdir(buf);
-            *p = c;
-        }
-    }
-    return _mkdir(buf);
-}
-#else
-#  include <unistd.h>
-#  define PATH_SEP '/'
-static int mkdirs(const char* path) {
-    char buf[512];
-    strncpy(buf, path, sizeof(buf)-1); buf[sizeof(buf)-1] = '\0';
-    for (char* p = buf+1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(buf, 0755);
-            *p = '/';
-        }
-    }
-    return mkdir(buf, 0755);
-}
-#endif
+#include <stdexcept>
+#include <string>
+#include "../coreinit/coreinit_fs.h"
+constexpr uint32_t SAVE_OK = 0;
 
-// FS status codes (same as coreinit_fs.cpp)
-#define SAVE_OK              0
-#define SAVE_NOT_FOUND      ((uint32_t)-6)
-#define SAVE_ACCESS_ERROR   ((uint32_t)-16)
+static void SAVEInit(CPUState* cpu) { coreinit_save_init(cpu); }
+static void SAVEInitSaveDir(CPUState* cpu) { coreinit_save_init_dir(cpu); }
+static void SAVEOpenFile(CPUState* cpu) { coreinit_save_open_file(cpu); }
+static void SAVEFlushQuota(CPUState* cpu) { coreinit_save_flush_quota(cpu); }
+static void SAVEMakeDir(CPUState* cpu) { coreinit_save_make_dir(cpu); }
+static void SAVEGetStat(CPUState* cpu) { coreinit_save_get_stat(cpu); }
+static void SAVEOpenDir(CPUState* cpu) { RET = uint32_t(-6); }
 
-// ---------------------------------------------------------------------------
-// Save file handle table (handles 1..127, distinct from FS handles)
-// ---------------------------------------------------------------------------
-static FILE* s_save_handles[128] = {};
-
-static uint32_t save_alloc_handle(FILE* f) {
-    for (int i = 1; i < 128; i++)
-        if (!s_save_handles[i]) { s_save_handles[i] = f; return (uint32_t)i; }
-    return 0;
-}
-
-// Build a host path for a save-data file.
-// Wii U save paths look like "/user/common/cache.dat" or just "savefile.bin".
-// We map them to ./save/<path>.
-static void save_host_path(char* out, size_t outsz,
-                            uint32_t path_guest, const uint8_t* mem) {
-    // Read the guest path string
-    char gpath[256]; gpath[0] = '\0';
-    for (int i = 0; i < 255; i++) {
-        char c = (char)mem[path_guest + i];
-        gpath[i] = c;
+// SAVEGetShared*Path(u64 titleId in r3:r4, const char* name r5, char* out r6,
+// u32 outLength r7). Formats match Cemu nn_save; the shared volume is served
+// by FS from RBREW_MLC_DIR. A name or output outside accessible guest memory,
+// or a path that does not fit, fails explicitly (Cemu: FATAL_ERROR + assert).
+static void save_shared_path(CPUState* cpu, const char* format) {
+    const uint32_t name = ARG2, out = ARG3, capacity = ARG4;
+    std::string file;
+    for (uint32_t at = name;; ++at) {
+        if (!name || !rbrew_memory_accessible(MEM, at, 1))
+            throw std::runtime_error("SAVE shared data name is outside accessible guest memory");
+        const uint8_t c = rbrew_read8(MEM, at);
         if (!c) break;
+        if (file.size() >= 0x200) throw std::runtime_error("SAVE shared data name is unterminated");
+        file.push_back(char(c));
     }
-    gpath[255] = '\0';
-    // Strip any leading /
-    const char* p = gpath;
-    while (*p == '/' || *p == '\\') p++;
-    // Replace remaining '/' with host path separator
-    char fixed[256];
-    for (int i = 0; i < 255; i++) {
-        char c = p[i];
-        if (!c) { fixed[i] = '\0'; break; }
-        fixed[i] = (c == '/' || c == '\\') ? PATH_SEP : c;
-    }
-    fixed[255] = '\0';
-    snprintf(out, outsz, "save%c%s", PATH_SEP, fixed);
-}
-
-static void SAVEInit(CPUState* cpu) {
-    mkdirs("save");   // ensure save dir exists
+    char path[0x300];
+    const int written = snprintf(path, sizeof(path), format, ARG0, ARG1, file.c_str());
+    if (written < 0 || uint32_t(written) >= capacity || size_t(written) >= sizeof(path))
+        throw std::runtime_error("SAVE shared path does not fit the guest output buffer");
+    if (!out || !rbrew_memory_accessible(MEM, out, uint64_t(written) + 1))
+        throw std::runtime_error("SAVE shared path output is outside accessible guest memory");
+    for (int i = 0; i <= written; ++i) rbrew_write8(MEM, out + uint32_t(i), uint8_t(path[i]));
     RET = SAVE_OK;
 }
-
-static void SAVEInitSaveDir(CPUState* cpu) {
-    mkdirs("save");
-    RET = SAVE_OK;
-}
-
-// SAVEOpenFile(client, block, accountSlot, path_guest, mode_guest, handle_out_guest, errorMask)
-// r3=client r4=block r5=slot r6=path r7=mode r8=handle_out r9=errorMask
-static void SAVEOpenFile(CPUState* cpu) {
-    uint32_t path_addr   = ARG3;    // r6
-    uint32_t mode_addr   = ARG4;    // r7
-    uint32_t handle_out  = ARG5;    // r8
-
-    if (!path_addr) { RET = SAVE_NOT_FOUND; return; }
-
-    char host_path[512];
-    save_host_path(host_path, sizeof(host_path), path_addr, MEM);
-
-    // Read mode string from guest
-    char mode[8] = "rb";
-    if (mode_addr) {
-        for (int i = 0; i < 7; i++) {
-            mode[i] = (char)MEM[mode_addr + i];
-            if (!mode[i]) break;
-        }
-        mode[7] = '\0';
-    }
-
-    // Ensure parent directory exists
-    {
-        char parent[512];
-        strncpy(parent, host_path, sizeof(parent)-1);
-        parent[sizeof(parent)-1] = '\0';
-        char* last_sep = nullptr;
-        for (char* p = parent; *p; p++)
-            if (*p == PATH_SEP) last_sep = p;
-        if (last_sep) { *last_sep = '\0'; mkdirs(parent); }
-    }
-
-    FILE* f = fopen(host_path, mode);
-    if (!f) {
-        // If opened for writing and file doesn't exist, try creating it
-        if (mode[0] == 'w' || mode[0] == 'a') {
-            f = fopen(host_path, "wb");
-        }
-        if (!f) {
-            fprintf(stderr, "[nn_save] SAVEOpenFile: cannot open '%s' (mode=%s)\n",
-                    host_path, mode);
-            if (handle_out) rbrew_write32(MEM, handle_out, (uint32_t)-1);
-            RET = SAVE_NOT_FOUND;
-            return;
-        }
-        if (mode[0] != 'w') { fclose(f); f = fopen(host_path, mode); }
-        if (!f) { RET = SAVE_NOT_FOUND; return; }
-    }
-
-    uint32_t h = save_alloc_handle(f);
-    if (!h) { fclose(f); RET = SAVE_ACCESS_ERROR; return; }
-
-    if (handle_out) rbrew_write32(MEM, handle_out, h);
-    fprintf(stderr, "[nn_save] SAVEOpenFile: opened '%s' (mode=%s) → handle %u\n",
-            host_path, mode, h);
-    RET = SAVE_OK;
-}
-
-// SAVEReadFile(client, block, buf_guest, size, count, handle, flags, errorMask)
-// r3=client r4=block r5=buf r6=size r7=count r8=handle r9=flags r10=errorMask
-static void SAVEReadFile(CPUState* cpu) {
-    uint32_t buf_addr = ARG2;   // r5
-    uint32_t elem_sz  = ARG3;   // r6
-    uint32_t count    = ARG4;   // r7
-    uint32_t handle   = ARG5;   // r8
-
-    if (handle == 0 || handle >= 128 || !s_save_handles[handle]) { RET = 0; return; }
-    if (!buf_addr || !elem_sz || !count) { RET = 0; return; }
-
-    size_t n = fread(MEM + buf_addr, elem_sz, count, s_save_handles[handle]);
-    RET = (uint32_t)n;
-}
-
-// SAVEWriteFile(client, block, buf_guest, size, count, handle, flags, errorMask)
-// r3=client r4=block r5=buf r6=size r7=count r8=handle r9=flags r10=errorMask
-static void SAVEWriteFile(CPUState* cpu) {
-    uint32_t buf_addr = ARG2;   // r5
-    uint32_t elem_sz  = ARG3;   // r6
-    uint32_t count    = ARG4;   // r7
-    uint32_t handle   = ARG5;   // r8
-
-    if (handle == 0 || handle >= 128 || !s_save_handles[handle]) { RET = 0; return; }
-    if (!buf_addr || !elem_sz || !count) { RET = 0; return; }
-
-    size_t n = fwrite(MEM + buf_addr, elem_sz, count, s_save_handles[handle]);
-    RET = (uint32_t)n;
-}
-
-// SAVECloseFile(client, block, handle, errorMask)
-// r3=client r4=block r5=handle r6=errorMask
-static void SAVECloseFile(CPUState* cpu) {
-    uint32_t handle = ARG2;   // r5
-    if (handle > 0 && handle < 128 && s_save_handles[handle]) {
-        fclose(s_save_handles[handle]);
-        s_save_handles[handle] = nullptr;
-    }
-    RET = SAVE_OK;
-}
-
-static void SAVEFlushQuota(CPUState* cpu) { RET = SAVE_OK; }
-
-// SAVEMakeDir(client, block, accountSlot, path_guest, errorMask)
-// r3=client r4=block r5=slot r6=path r7=errorMask
-static void SAVEMakeDir(CPUState* cpu) {
-    uint32_t path_addr = ARG3;   // r6
-    if (!path_addr) { RET = SAVE_OK; return; }
-    char host_path[512];
-    save_host_path(host_path, sizeof(host_path), path_addr, MEM);
-    mkdirs(host_path);
-    RET = SAVE_OK;
-}
-
-// SAVEGetStat(client, block, accountSlot, path_guest, stat_out, errorMask)
-// r3=client r4=block r5=slot r6=path r7=stat_out r8=errorMask
-// FSStat layout (big-endian, relevant fields only):
-//   +0x00 uint32 flags       (bitfield: 0x80000000 = is directory, 0x01000000 = file)
-//   +0x04 uint32 permissions
-//   +0x10 uint32 size        (file size in bytes)
-static void SAVEGetStat(CPUState* cpu) {
-    uint32_t path_addr = ARG3;   // r6
-    uint32_t stat_out  = ARG4;   // r7
-
-    if (!path_addr) { RET = SAVE_NOT_FOUND; return; }
-
-    char host_path[512];
-    save_host_path(host_path, sizeof(host_path), path_addr, MEM);
-
-    struct stat st;
-    if (::stat(host_path, &st) != 0) {
-        RET = SAVE_NOT_FOUND;
-        return;
-    }
-
-    if (stat_out) {
-        // Zero the stat structure (0x64 bytes)
-        for (int i = 0; i < 0x64; i += 4)
-            rbrew_write32(MEM, stat_out + (uint32_t)i, 0u);
-
-        uint32_t flags = 0;
-#ifdef S_ISDIR
-        if (S_ISDIR(st.st_mode)) flags = 0x80000000u;
-        else flags = 0x01000000u;
-#endif
-        rbrew_write32(MEM, stat_out + 0x00u, flags);
-        rbrew_write32(MEM, stat_out + 0x04u, 0x000001FFu);  // rwxrwxrwx
-        rbrew_write32(MEM, stat_out + 0x10u, (uint32_t)st.st_size);
-    }
-    RET = SAVE_OK;
-}
-
-static void SAVEOpenDir(CPUState* cpu)  { RET = SAVE_NOT_FOUND; }
-static void SAVECloseDir(CPUState* cpu) { RET = SAVE_OK; }
-static void SAVEReadDir(CPUState* cpu)  { RET = SAVE_NOT_FOUND; }
-
 static void SAVEGetSharedDataTitlePath(CPUState* cpu) {
-    if (ARG2) rbrew_write8(MEM, ARG2, 0);
-    RET = SAVE_OK;
+    save_shared_path(cpu, "/vol/storage_mlc01/sys/title/%08x/%08x/content/%s");
 }
 static void SAVEGetSharedSaveDataPath(CPUState* cpu) {
-    if (ARG2) rbrew_write8(MEM, ARG2, 0);
-    RET = SAVE_OK;
+    save_shared_path(cpu, "/vol/storage_mlc01/usr/save/%08x/%08x/user/common/%s");
 }
 
 static void SAVEGetFreeSpaceSize(CPUState* cpu) {
@@ -312,6 +104,19 @@ static void BOSSInit(CPUState* cpu)             { RET = (uint32_t)-1; }
 static void BOSSGetStorageInfo(CPUState* cpu)   { RET = (uint32_t)-1; }
 static void BOSSGetTaskIdList(CPUState* cpu)    { RET = (uint32_t)-1; }
 
+// nn::boss::DataName::DataName() - nn_boss.rpl 02027700: a null this is
+// allocated from the nn_boss allocator (0x20 bytes); the 32-byte name is
+// zeroed and this returned. Gambit constructs arrays of them (0279404C).
+static void BOSSDataNameCtor(CPUState* cpu) {
+    const uint32_t self = ARG0;
+    if (!self)
+        throw std::runtime_error("nn::boss::DataName::DataName(nullptr): nn_boss allocator not implemented");
+    if (!rbrew_memory_accessible(MEM, self, 0x20))
+        throw std::runtime_error("nn::boss::DataName::DataName: object outside guest memory");
+    memset(MEM + self, 0, 0x20);
+    RET = self;
+}
+
 // ---------------------------------------------------------------------------
 // nn_nfp — Amiibo (not present)
 // ---------------------------------------------------------------------------
@@ -337,6 +142,27 @@ static void FPGetFriendList(CPUState* cpu) {
 }
 static void FPGetFriendCount(CPUState* cpu)     { RET = 0; }
 static void FPIsOnline(CPUState* cpu)           { RET = 0; }
+
+// nn::fp::LoginAsync(callback, userParam) - nn_fp.rpl 020019dc forwards the
+// request to the friends service (FPD), which later completes it by calling
+// callback(const nn::Result*, userParam) (PPC EABI passes the Result by
+// pointer). Without an online account the service completes at once with
+// success (Cemu iosu_fpd CallHandler_LoginAsync: Splatoon softlocks
+// otherwise). Gambit's callback 02A7B590 stores the result and signals the
+// event its loader waits on; completing before returning has that effect.
+static void FPLoginAsync(CPUState* cpu) {
+    const uint32_t callback = ARG0, user = ARG1;
+    if (callback) {
+        CPUState call = *cpu;
+        call.r[1] = (cpu->r[1] - 0x40) & ~0xFu;       // frame below the caller's
+        const uint32_t result = call.r[1] + 0x10;
+        rbrew_write32(MEM, call.r[1], cpu->r[1]);     // back chain
+        rbrew_write32(MEM, result, 0);                // nn::Result: success
+        call.r[3] = result; call.r[4] = user;
+        rbrew_dispatch(&call, callback);
+    }
+    RET = 0;
+}
 static void FPFinalize(CPUState* cpu)           { (void)cpu; }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +335,8 @@ void stubs_register(CPUState* cpu) {
     // REG(FPGetFriendCount); // not in this game's PLT
     // REG(FPIsOnline); // not in this game's PLT
     // REG(FPFinalize); // not in this game's PLT
+    rbrew_register_func(cpu, ADDR_LoginAsync__Q2_2nn2fpFPFQ2_2nn6ResultPv_vPv, FPLoginAsync);
+    rbrew_register_func(cpu, ADDR___ct__Q3_2nn4boss8DataNameFv, BOSSDataNameCtor);
     // proc_ui
     REG(ProcUIInit);
     // REG(ProcUIInitEx); // not in this game's PLT

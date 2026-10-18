@@ -1,6 +1,7 @@
 #include "elf_reader.hpp"
 #include <fstream>
 #include <cstring>
+#include <zlib.h>
 
 namespace rebrewu::elf {
 
@@ -113,6 +114,29 @@ bool ElfReader::parse_shdrs(std::span<const uint8_t> bytes,
             }
             out.sections[i].data.assign(bytes.data() + off,
                                         bytes.data() + off + size);
+            // Decode every compressed section before names, symbols and RELA
+            // are read. Metadata sections are compressed in retail RPX files too.
+            if (sh.is_rpl_zlib_compressed()) {
+                const auto& packed = out.sections[i].data;
+                if (packed.size() < 4) {
+                    m_diag.error("truncated compressed section " + std::to_string(i));
+                    return false;
+                }
+                uint32_t be_size;
+                std::memcpy(&be_size, packed.data(), sizeof(be_size));
+                uint32_t decoded_size = from_be(be_size);
+                std::vector<uint8_t> decoded(decoded_size);
+                uLongf actual_size = decoded_size;
+                int status = uncompress(decoded.data(), &actual_size,
+                    packed.data() + 4, static_cast<uLong>(packed.size() - 4));
+                if (status != Z_OK || actual_size != decoded_size) {
+                    m_diag.error("invalid compressed section " + std::to_string(i));
+                    return false;
+                }
+                out.sections[i].data = std::move(decoded);
+                sh.sh_size = from_be(decoded_size);
+                sh.sh_flags = from_be(sh.flags() & ~SHF_RPL_ZLIB);
+            }
         }
     }
     return true;
@@ -128,7 +152,14 @@ bool ElfReader::resolve_section_names(std::span<const uint8_t> /*bytes*/,
     for (auto& sec : out.sections) {
         uint32_t name_off = sec.header.name();
         if (name_off < strtab.size()) {
-            sec.name = reinterpret_cast<const char*>(strtab.data() + name_off);
+            const char* start = reinterpret_cast<const char*>(strtab.data() + name_off);
+            const auto* end = static_cast<const char*>(
+                std::memchr(start, 0, strtab.size() - name_off));
+            if (!end) {
+                m_diag.error("unterminated section name");
+                return false;
+            }
+            sec.name.assign(start, end);
         }
     }
     return true;

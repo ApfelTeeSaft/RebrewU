@@ -22,6 +22,10 @@
 
 namespace rebrewu::rpx {
 
+/// PLT slot of an address-taken function import with no call site, from its
+/// pre-linked ADDR16_HA/LO halves (see RpxLoader::decode_imports).
+std::optional<uint32_t> address_taken_import_slot(const RpxModule& m, size_t sym_index, uint32_t sym_address);
+
 class RpxLoader {
 public:
     explicit RpxLoader(diagnostics::DiagEngine& diag) noexcept;

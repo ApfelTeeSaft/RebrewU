@@ -73,6 +73,7 @@ enum class Opcode : uint16_t {
     Branch,      // conditional branch (cond, true_block, false_block)
     IndirectJump,// bctr — indirect branch through CTR
     Call,        // bl — direct call (addr, [ret_reg])
+    ConditionalCall, // bcl/bcla — linked direct call (taken_condition, addr); resumes at PC+4
     IndirectCall,// bctrl — indirect call through CTR
     Return,      // blr
     ConditionalReturn, // bclr — return to LR if condition, else fall through (cond, fallthrough_addr)
@@ -114,15 +115,21 @@ enum class Opcode : uint16_t {
     Load16,
     Load16S,
     Load32,
+    LoadReserve32, // establishes a runtime reservation, even if result is unused
     Load64,
     LoadFloat32,
     LoadFloat64,
     Store8,
     Store16,
     Store32,
+    StoreConditional32, // consumes reservation and updates CR0.EQ/SO
     Store64,
     StoreFloat32,
     StoreFloat64,
+    StoreFloatInteger32, // stfiwx: raw low FPR word, not a float store
+    PairedSingle,  // rbrew_ps(cpu, word): paired-single / GQR instruction (imm word)
+    PairedFill,    // ps1[n] = f[n]: single-precision scalar result fills slot 1 (imm n)
+    Trap,          // rbrew_trap(cpu, word, pc): tw/twi, traps when the TO condition holds
 
     // Register transfer
     Move,
@@ -130,6 +137,7 @@ enum class Opcode : uint16_t {
     SignExtend,
 
     // Floating point
+    FSelect,     // nonrecord fsel: condition, nonnegative value, negative/NaN value
     FAdd,
     FSub,
     FMul,
@@ -143,6 +151,7 @@ enum class Opcode : uint16_t {
     FNmadd,
     FNmsub,
     FCvtToInt,
+    FCvtToIntZero, // fctiwz integer payload and conversion status; operand 1 is Rc
     FCvtFromInt,
     FCvtPrecision,
 

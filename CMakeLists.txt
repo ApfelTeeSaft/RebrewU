@@ -24,7 +24,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
         "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
 endif()
 
-option(REBREWU_BUILD_TESTS  "Build the RebrewU test suite"          ON)
+option(REBREWU_BUILD_TESTS  "Build the RebrewU test suite"          OFF)
 option(REBREWU_ENABLE_ASAN  "Enable AddressSanitizer"               OFF)
 option(REBREWU_INSTALL      "Generate CMake install / package rules" OFF)
 
@@ -68,7 +68,7 @@ add_subdirectory(runtime)           # INTERFACE – runtime shim headers
 
 add_subdirectory(src/cli)
 
-if(REBREWU_BUILD_TESTS)
+if(REBREWU_BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
 
     include(FetchContent)

@@ -1,3 +1,4 @@
+#include "../../runtime/rbrew_diagnostics.h"
 // coreinit miscellaneous: time, I/O, system info, debug, mem helpers
 #include "../os_common.h"
 #include <chrono>
@@ -7,18 +8,30 @@
 #include <mutex>
 #include <condition_variable>
 #include <unordered_map>
+#include <stdexcept>
+#include "coreinit_dynload.h"
+#include "coreinit_system_settings.h"
+#include "coreinit_user_config.h"
 
 using namespace std::chrono;
 
-// Wii U timer runs at ~244.8 MHz
-static constexpr uint64_t WIIU_TIMER_FREQ = 244800000ULL;
-static auto s_boot_time = steady_clock::now();
+static constexpr uint64_t WIIU_TIMER_FREQ = RBREW_TIMER_CLOCK;
+// OSGetTime counts timer ticks since 2000-01-01 00:00:00; OSGetSystemTime
+// counts since boot. Their difference is OSSystemInfo.baseTime.
+static const uint64_t s_base_time = [] {
+    const auto since_unix = duration_cast<microseconds>(system_clock::now().time_since_epoch()).count();
+    const int64_t since_2000 = since_unix - int64_t(946684800) * 1000000;
+    return since_2000 > 0 ? uint64_t(since_2000) / 1000000u * WIIU_TIMER_FREQ +
+                            uint64_t(since_2000) % 1000000u * WIIU_TIMER_FREQ / 1000000u : 0u;
+}();
 
-static uint64_t get_wiiu_ticks() {
-    auto now = steady_clock::now();
-    auto us = duration_cast<microseconds>(now - s_boot_time).count();
-    return (uint64_t)us * WIIU_TIMER_FREQ / 1000000ULL;
+static void require_guest_range(CPUState* cpu,uint32_t address,uint64_t size) {
+    if (uint64_t(address)+size>cpu->guest_memory_size ||
+        !rbrew_memory_accessible(MEM,address,size))
+        throw std::runtime_error("Coreinit guest buffer is outside accessible memory");
 }
+
+static uint64_t get_wiiu_ticks() { return rbrew_system_ticks(); }
 
 // --- Time ---
 static void OSGetSystemTime(CPUState* cpu) {
@@ -26,23 +39,56 @@ static void OSGetSystemTime(CPUState* cpu) {
     cpu->r[3] = (uint32_t)(t >> 32);
     cpu->r[4] = (uint32_t)(t);
 }
-static void OSGetTime(CPUState* cpu)  { OSGetSystemTime(cpu); }
+static void OSGetTime(CPUState* cpu)  {
+    const uint64_t t = s_base_time + get_wiiu_ticks();
+    cpu->r[3] = (uint32_t)(t >> 32);
+    cpu->r[4] = (uint32_t)(t);
+}
+
+// OSGetSystemInfo returns a pointer to coreinit's static OSSystemInfo
+// (coreinit.rpl: "return &systemInfo"). Layout and boot values per decaf
+// coreinit_systeminfo: busSpeed, coreSpeed, baseTime, l2CacheSize[3], cpuRatio.
+uint32_t coreinit_alloc_system_block(uint32_t size); // coreinit_memory.cpp
+static void OSGetSystemInfo(CPUState* cpu) {
+    static uint32_t info = 0;
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        info = coreinit_alloc_system_block(0x20);
+        if (!info) throw std::runtime_error("OSSystemInfo storage could not be allocated");
+        rbrew_write32(MEM, info + 0x00, RBREW_BUS_CLOCK);
+        rbrew_write32(MEM, info + 0x04, RBREW_CORE_CLOCK);
+        rbrew_write32(MEM, info + 0x08, uint32_t(s_base_time >> 32));
+        rbrew_write32(MEM, info + 0x0C, uint32_t(s_base_time));
+        rbrew_write32(MEM, info + 0x10, 512u * 1024u);
+        rbrew_write32(MEM, info + 0x14, 2u * 1024u * 1024u);
+        rbrew_write32(MEM, info + 0x18, 512u * 1024u);
+        rbrew_write32(MEM, info + 0x1C, RBREW_CORE_CLOCK / RBREW_BUS_CLOCK); // 5
+    });
+    RET = info;
+}
 static void OSGetTick(CPUState* cpu)  { RET = (uint32_t)get_wiiu_ticks(); }
 
 static void OSTicksToCalendarTime(CPUState* cpu) {
     // r3:r4 = ticks (64-bit), r5 = OSCalendarTime* out
     // Fill in a plausible UTC structure (OSCalendarTime: sec,min,hour,mday,mon,year,wday,yday,msec,usec)
     uint32_t out = ARG2;
-    if (out) memset(MEM + out, 0, 40);
+    if (out) { require_guest_range(cpu,out,40);memset(MEM + out, 0, 40); }
     RET = 0;
 }
 
 // --- Core info ---
-static void OSGetCoreId(CPUState* cpu)    { RET = 0; }
+static void OSGetCoreId(CPUState* cpu)    { RET = rbrew_current_core(); }
 static void OSGetMainCoreId(CPUState* cpu){ RET = 1; }
 
 // --- Logging ---
-static void OSReport(CPUState* cpu) { (void)cpu; }
+// Diagnostic only: the format string and its first two raw arguments.
+static void OSReport(CPUState* cpu) {
+    if (!ARG0 || !rbrew_memory_accessible(cpu->mem, ARG0, 1)) return;
+    const char* fmt = (const char*)(MEM + ARG0);
+    size_t length = strnlen(fmt, size_t(std::min<uint64_t>(256, cpu->guest_memory_size - ARG0)));
+    while (length && fmt[length - 1] == '\n') --length;
+    RBREW_LOGF(stderr, "[OSReport] %.*s [r4=%08X r5=%08X]\n", int(length), fmt, ARG1, ARG2);
+}
 static void OSPanic(CPUState* cpu)  {
     // OSPanic(const char* file, int line, const char* fmt, ...)
     // r3=file, r4=line, r5=fmt, r6..=varargs
@@ -50,9 +96,22 @@ static void OSPanic(CPUState* cpu)  {
     int         line = (int)ARG1;
     const char* fmt  = ARG2 ? (const char*)(MEM + ARG2) : "";
     // Print with up to 3 integer varargs (r6/r7/r8)
-    fprintf(stderr, "[OSPanic] %s:%d  ", file, line);
-    fprintf(stderr, fmt, cpu->r[6], cpu->r[7], cpu->r[8]);
-    fprintf(stderr, "\n");
+    RBREW_LOGF(stderr, "[OSPanic] %s:%d  ", file, line);
+    RBREW_LOGF(stderr, fmt, cpu->r[6], cpu->r[7], cpu->r[8]);
+    RBREW_LOGF(stderr, "\n");
+    // Read-only caller attribution. EABI frames hold the previous SP at +0 and
+    // the callee-saved LR in the previous frame at +4. Stop at any unreadable,
+    // misaligned or non-increasing link; never write guest state.
+    RBREW_LOGF(stderr, "[OSPanic]   LR=%08X SP=%08X chain:", cpu->lr, cpu->r[1]);
+    uint32_t sp = cpu->r[1];
+    for (int depth = 0; depth < 16; ++depth) {
+        if ((sp & 3u) || !rbrew_memory_accessible(cpu->mem, sp, 4)) break;
+        const uint32_t prev = rbrew_read32(cpu->mem, sp);
+        if (!prev || (prev & 3u) || prev <= sp || !rbrew_memory_accessible(cpu->mem, prev, 8)) break;
+        RBREW_LOGF(stderr, " %08X", rbrew_read32(cpu->mem, prev + 4));
+        sp = prev;
+    }
+    RBREW_LOGF(stderr, "\n");
     // Do NOT abort() — let the game continue.  A real Wii U OSPanic would
     // halt the system, but during bring-up we want to see what happens after
     // non-fatal panics (e.g. "unhandled signal 6" from the fiber scheduler).
@@ -78,12 +137,10 @@ static void OSBlockThreadsOnExit(CPUState* cpu) { (void)cpu; }
 
 // --- Dynamic loading ---
 static void OSDynLoad_Acquire(CPUState* cpu) {
-    if (ARG1) rbrew_write32(MEM, ARG1, 0x50000042u);
-    RET = 0;
+    rbrew_dynload_acquire(cpu);
 }
 static void OSDynLoad_FindExport(CPUState* cpu) {
-    if (ARG3) rbrew_write32(MEM, ARG3, 0u);
-    RET = 0xFFFFFFFFu;
+    rbrew_dynload_find_export(cpu);
 }
 
 // --- Cache (no-op on cache-coherent host) ---
@@ -93,41 +150,44 @@ static void DCInvalidateRange(CPUState* cpu) { (void)cpu; }
 static void DCStoreRange(CPUState* cpu)      { (void)cpu; }
 static void DCZeroRange(CPUState* cpu) {
     uint32_t addr = ARG0, len = ARG1;
-    if (addr && len) memset(MEM + addr, 0, len);
+    if (addr && len) { require_guest_range(cpu,addr,len);memset(MEM + addr, 0, len); }
 }
 static void OSMemoryBarrier(CPUState* cpu) { (void)cpu; }
 
 // --- Memory block ops ---
 static void OSBlockMove(CPUState* cpu) {
     uint32_t dst = ARG0, src = ARG1, len = ARG2;
-    if (dst && src && len) memmove(MEM + dst, MEM + src, len);
+    if (dst && src && len) {
+        require_guest_range(cpu,dst,len);require_guest_range(cpu,src,len);
+        memmove(MEM + dst, MEM + src, len);
+    }
 }
 static void OSBlockSet(CPUState* cpu) {
     uint32_t dst = ARG0, val = ARG1, len = ARG2;
-    if (dst && len) memset(MEM + dst, (int)val, len);
+    if (dst && len) { require_guest_range(cpu,dst,len);memset(MEM + dst, (int)val, len); }
 }
 
 // --- Host memcpy/memmove/memset passed through ---
 static void memcpy_fn(CPUState* cpu) {
     uint32_t dst = ARG0, src = ARG1, n = ARG2;
-    if (dst && src && n && (uint64_t)dst + n <= WIIU_MEM_SIZE && (uint64_t)src + n <= WIIU_MEM_SIZE)
+    if (dst && src && n && rbrew_memory_accessible(MEM,dst,n) && rbrew_memory_accessible(MEM,src,n))
         memcpy(MEM + dst, MEM + src, n);
     RET = dst;
 }
 static void memmove_fn(CPUState* cpu) {
     uint32_t dst = ARG0, src = ARG1, n = ARG2;
-    if (dst && src && n && (uint64_t)dst + n <= WIIU_MEM_SIZE && (uint64_t)src + n <= WIIU_MEM_SIZE)
+    if (dst && src && n && rbrew_memory_accessible(MEM,dst,n) && rbrew_memory_accessible(MEM,src,n))
         memmove(MEM + dst, MEM + src, n);
     RET = dst;
 }
 static void memset_fn(CPUState* cpu) {
     uint32_t dst = ARG0, val = ARG1, n = ARG2;
     if (dst && n) {
-        // Guard against OOB: skip if dst+n would exceed the 768MB arena
-        if ((uint64_t)dst + n <= WIIU_MEM_SIZE)
+        // Retain the OOB guard for unmapped holes and a disabled overlay too.
+        if (rbrew_memory_accessible(MEM,dst,n))
             memset(MEM + dst, (int)val, n);
         else
-            fprintf(stderr, "[coreinit] memset OOB: dst=0x%08X n=0x%X\n", dst, n);
+            RBREW_LOGF(stderr, "[coreinit] memset OOB: dst=0x%08X n=0x%X\n", dst, n);
     }
     RET = dst;
 }
@@ -152,21 +212,17 @@ static void OSSavesDone_ReadyToRelease(CPUState* cpu) { (void)cpu; }
 // ---------------------------------------------------------------------------
 // OSMessageQueue — bounded blocking message queue
 //
-// Wii U layout (approximate):
-//   +0x00 uint32_t tag        (0x4D534751)
-//   +0x04 OSThreadQueue recvQ (8 bytes)
-//   +0x0C OSThreadQueue sendQ (8 bytes)
-//   +0x14 uint32_t* messages  (guest ptr to uint32_t[msgCount])
-//   +0x18 uint32_t  msgCount  (capacity)
-//   +0x1C uint32_t  firstIndex
-//   +0x20 uint32_t  usedCount
-//
-// We maintain a host-side struct keyed by guest queue address.
-// Messages are 32-bit guest values (pointers or opaque IDs).
-//
-// OSSendMessage flags:    0=non-blocking, 1=blocking, 2=high-priority
-// OSReceiveMessage flags: 0=non-blocking, 1=blocking
+// Layout per wut coreinit/messagequeue.h and decaf-emu (0x3C bytes):
+//   +0x00 tag 'mSgQ'  +0x04 name  +0x0C sendQueue  +0x1C recvQueue
+//   +0x2C OSMessage* messages  +0x30 size  +0x34 first  +0x38 used
+// OSMessage is 16 bytes {message, args[3]}; send/receive copy whole
+// entries. Flags: 1 = blocking, 2 = high priority (pushed to the front).
+// Blocking uses host condition variables; the guest-visible fields are
+// mirrored after every change.
 // ---------------------------------------------------------------------------
+constexpr uint32_t kMessageQueueTag = 0x6D536751u;
+constexpr uint32_t kMessageSize = 0x10;
+constexpr uint32_t kMessageFlagBlocking = 1, kMessageFlagHighPriority = 2;
 struct MsgQueueImpl {
     std::mutex              mtx;
     std::condition_variable not_empty;
@@ -188,82 +244,72 @@ static MsgQueueImpl* get_mq(uint32_t ptr) {
     s_msg_queues[ptr] = q;
     return q;
 }
+// Caller holds mq->mtx.
+static void mirror_mq(CPUState* cpu, uint32_t q_addr, const MsgQueueImpl* mq) {
+    rbrew_write32(MEM, q_addr + 0x34, mq->head);
+    rbrew_write32(MEM, q_addr + 0x38, mq->count);
+}
+static void copy_message(CPUState* cpu, uint32_t to, uint32_t from) {
+    require_guest_range(cpu, to, kMessageSize); require_guest_range(cpu, from, kMessageSize);
+    for (uint32_t i = 0; i < kMessageSize; i += 4) rbrew_write32(MEM, to + i, rbrew_read32(MEM, from + i));
+}
 
-// OSInitMessageQueue(queue, msgbuf, msgCount)
-// r3=queue ptr, r4=message buffer guest ptr, r5=capacity
+// OSInitMessageQueue(queue, messages, size)
 static void OSInitMessageQueue(CPUState* cpu) {
-    uint32_t q_addr  = ARG0;
-    uint32_t buf_ptr = ARG1;
-    uint32_t cap     = ARG2;
-    if (!q_addr) return;
-
+    const uint32_t q_addr = ARG0, buf_ptr = ARG1, cap = ARG2;
+    require_guest_range(cpu, q_addr, 0x3C);
+    if (!cap || !buf_ptr) throw std::runtime_error("OSInitMessageQueue requires a message array");
+    require_guest_range(cpu, buf_ptr, uint64_t(cap) * kMessageSize);
     MsgQueueImpl* mq = get_mq(q_addr);
     std::lock_guard<std::mutex> lk(mq->mtx);
     mq->buf_addr = buf_ptr;
-    mq->capacity = cap ? cap : 1;
+    mq->capacity = cap;
     mq->head     = 0;
     mq->count    = 0;
-
-    // Zero the guest struct (tag + counts)
-    if ((uint64_t)q_addr + 0x28u < WIIU_MEM_SIZE)
-        memset(MEM + q_addr, 0, 0x28);
+    memset(MEM + q_addr, 0, 0x3C);
+    rbrew_write32(MEM, q_addr, kMessageQueueTag);
+    rbrew_write32(MEM, q_addr + 0x2C, buf_ptr);
+    rbrew_write32(MEM, q_addr + 0x30, cap);
+    mirror_mq(cpu, q_addr, mq);
 }
 
-// OSSendMessage(queue, message, flags)
-// r3=queue, r4=msg (uint32), r5=flags (1=blocking)
+// OSSendMessage(queue, const OSMessage* message, flags) -> BOOL
 static void OSSendMessage(CPUState* cpu) {
-    uint32_t q_addr = ARG0;
-    uint32_t msg    = ARG1;
-    bool     block  = (ARG2 & 1) != 0;
-
+    const uint32_t q_addr = ARG0, message = ARG1, flags = ARG2;
     MsgQueueImpl* mq = get_mq(q_addr);
     std::unique_lock<std::mutex> lk(mq->mtx);
-
-    if (block) {
-        mq->not_full.wait(lk, [mq]{ return mq->count < mq->capacity; });
+    if (!mq->capacity) throw std::runtime_error("OSSendMessage on an uninitialized queue");
+    if (flags & kMessageFlagBlocking) mq->not_full.wait(lk, [mq]{ return mq->count < mq->capacity; });
+    else if (mq->count >= mq->capacity) { RET = 0; return; }
+    uint32_t index;
+    if (flags & kMessageFlagHighPriority) {
+        mq->head = mq->head ? mq->head - 1 : mq->capacity - 1;
+        index = mq->head;
     } else {
-        if (mq->count >= mq->capacity) { RET = 0; return; } // FALSE = full
+        index = (mq->head + mq->count) % mq->capacity;
     }
-
-    uint32_t tail = (mq->head + mq->count) % mq->capacity;
-    if (mq->buf_addr && (uint64_t)mq->buf_addr + tail * 4u + 4u < WIIU_MEM_SIZE)
-        rbrew_write32(MEM, mq->buf_addr + tail * 4u, msg);
+    copy_message(cpu, mq->buf_addr + index * kMessageSize, message);
     mq->count++;
+    mirror_mq(cpu, q_addr, mq);
     lk.unlock();
-    mq->not_empty.notify_one();
-    RET = 1; // TRUE
+    mq->not_empty.notify_all();
+    RET = 1;
 }
 
-// OSReceiveMessage(queue, msg_out, flags)
-// r3=queue, r4=out ptr, r5=flags (1=blocking)
+// OSReceiveMessage(queue, OSMessage* message, flags) -> BOOL
 static void OSReceiveMessage(CPUState* cpu) {
-    uint32_t q_addr  = ARG0;
-    uint32_t out_ptr = ARG1;
-    bool     block   = (ARG2 & 1) != 0;
-
+    const uint32_t q_addr = ARG0, out_ptr = ARG1, flags = ARG2;
     MsgQueueImpl* mq = get_mq(q_addr);
     std::unique_lock<std::mutex> lk(mq->mtx);
-
-    if (block) {
-        mq->not_empty.wait(lk, [mq]{ return mq->count > 0; });
-    } else {
-        if (mq->count == 0) {
-            if (out_ptr) rbrew_write32(MEM, out_ptr, 0u);
-            RET = 0; return;
-        }
-    }
-
-    uint32_t msg = 0;
-    if (mq->buf_addr && (uint64_t)mq->buf_addr + mq->head * 4u + 4u < WIIU_MEM_SIZE)
-        msg = rbrew_read32(MEM, mq->buf_addr + mq->head * 4u);
-
+    if (flags & kMessageFlagBlocking) mq->not_empty.wait(lk, [mq]{ return mq->count > 0; });
+    else if (mq->count == 0) { RET = 0; return; } // message left untouched
+    copy_message(cpu, out_ptr, mq->buf_addr + mq->head * kMessageSize);
     mq->head = (mq->head + 1) % mq->capacity;
     mq->count--;
+    mirror_mq(cpu, q_addr, mq);
     lk.unlock();
-
-    if (out_ptr) rbrew_write32(MEM, out_ptr, msg);
-    mq->not_full.notify_one();
-    RET = 1; // TRUE
+    mq->not_full.notify_all();
+    RET = 1;
 }
 
 // --- Alarms (no-op) ---
@@ -285,18 +331,14 @@ static void __ghsUnlock(CPUState* cpu) { (void)cpu; }
 static void __gh_set_errno(CPUState* cpu) { (void)cpu; }
 
 // --- MCP (system settings) ---
-static void MCP_Open(CPUState* cpu)  { RET = 1; } // handle 1
-static void MCP_Close(CPUState* cpu) { RET = 0; }
-static void MCP_GetSysProdSettings(CPUState* cpu) {
-    uint32_t out = ARG1;
-    if (out) memset(MEM + out, 0, 0x60); // zeroed MCPSysProdSettings
-    RET = 0;
-}
+static void MCP_Open(CPUState* cpu)  { rbrew_mcp_open(cpu); }
+static void MCP_Close(CPUState* cpu) { rbrew_mcp_close(cpu); }
+static void MCP_GetSysProdSettings(CPUState* cpu) { rbrew_mcp_get_sys_prod_settings(cpu); }
 
 // --- UC (user config) ---
-static void UCOpen(CPUState* cpu)  { RET = 1; }
-static void UCClose(CPUState* cpu) { RET = 0; }
-static void UCReadSysConfig(CPUState* cpu) { RET = 0xFFFFFFFFu; } // error = not found
+static void UCOpen(CPUState* cpu)  { rbrew_uc_open(cpu); }
+static void UCClose(CPUState* cpu) { rbrew_uc_close(cpu); }
+static void UCReadSysConfig(CPUState* cpu) { rbrew_uc_read_sys_config(cpu); }
 
 // --- Misc ---
 static void bspGetHardwareVersion(CPUState* cpu) { RET = 0x00000001u; }
@@ -311,6 +353,7 @@ void coreinit_misc_register(CPUState* cpu) {
 #define REG(name) rbrew_register_func(cpu, ADDR_##name, name)
     REG(OSGetSystemTime);
     REG(OSGetTime);
+    REG(OSGetSystemInfo);
     REG(OSGetTick);
     REG(OSTicksToCalendarTime);
     REG(OSGetCoreId);

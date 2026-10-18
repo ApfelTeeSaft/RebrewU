@@ -50,6 +50,9 @@
 #define ADDR_IsSlotOccupied__Q2_2nn3actFUc 0x02D0C2A0u
 
 // --- nn_boss ---
+// Address-taken only (no call site): PLT slot from the lis/addi halves
+// (rebrewu address_taken_import_slot), not in the call-site PLT list.
+#define ADDR___ct__Q3_2nn4boss8DataNameFv 0x02D0D9E0u
 #define ADDR_AddInternalCaCert__Q3_2nn4boss14NetTaskSettingFSc 0x02D0D048u
 #define ADDR_AddLargeHttpHeader__Q3_2nn4boss16RawUlTaskSettingFPCcT1 0x02D0D058u
 #define ADDR_ErrorCode__Q3_2nn4boss10TaskResultCFv 0x02D0D168u

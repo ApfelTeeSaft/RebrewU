@@ -14,6 +14,7 @@ namespace rebrewu::cli {
     Disassemble,   // disassemble a range
     ListExports,   // list RPL exports
     ListImports,   // list RPL imports
+    Audit,         // reusable read-only discovery/CFG inventory
     Analyze,       // run analysis only (no codegen)
     Help,
     Version
@@ -45,6 +46,9 @@ namespace rebrewu::cli {
     bool verbose{false};
     bool color{true};
     bool no_codegen{false};
+    bool emit_ppc_image{false}; // relocated executable bytes for opt-in fallback
+    std::string hints_file; // diagnostic: extra forced entry addresses (hex per line)
+    std::string analyzer_entries_file; // external analyzer starts, corroboration only
   };
 
   std::optional<CliOptions> parse(int argc, char** argv);

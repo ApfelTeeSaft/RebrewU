@@ -24,12 +24,16 @@ namespace rebrewu::analysis {
     // Build IR function from a known function address
     std::optional<ir::IRFunction> build(uint32_t entry_addr, std::string_view name = "");
 
+    struct InlineTableAudit { std::vector<uint32_t> targets; std::string reason; };
+    InlineTableAudit audit_inline_branch(uint32_t pc) const;
+
     // Get last error
     std::string_view last_error() const { return m_last_error; }
 
   private:
     // linear scan to find all block leaders
-    std::set<uint32_t> find_leaders(uint32_t entry, uint32_t text_end);
+    std::set<uint32_t> find_leaders(uint32_t entry, uint32_t text_end, ir::IRFunction& func);
+    std::vector<uint32_t> inline_branch_targets(uint32_t branch_pc) const;
     // decode and split into blocks
     void build_blocks(ir::IRFunction& func, const std::set<uint32_t>& leaders, uint32_t text_end);
     // lower PPC instrs to IR

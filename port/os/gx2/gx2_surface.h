@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
-// GX2Surface field offsets (size: 0x9C bytes)
+// GX2Surface field offsets (Cafe guest ABI size: 0x74 bytes)
 // ---------------------------------------------------------------------------
 #define GX2SURF_DIM           0x00u  // GX2SurfaceDim
 #define GX2SURF_WIDTH         0x04u
@@ -24,45 +24,46 @@
 #define GX2SURF_SWIZZLE       0x34u
 #define GX2SURF_ALIGNMENT     0x38u
 #define GX2SURF_PITCH         0x3Cu
-#define GX2SURF_SIZEOF        0x9Cu
+#define GX2SURF_MIP_OFFSETS   0x40u  // 13 uint32 mip-level offsets
+#define GX2SURF_SIZEOF        0x74u
 
 // ---------------------------------------------------------------------------
-// GX2ColorBuffer field offsets (size: 0xC4 bytes)
+// GX2ColorBuffer field offsets (size: 0x9C bytes)
 // ---------------------------------------------------------------------------
 #define GX2CB_SURFACE         0x00u  // GX2Surface embedded
-#define GX2CB_VIEW_MIP        0x9Cu
-#define GX2CB_VIEW_FIRST_SLICE 0xA0u
-#define GX2CB_VIEW_NUM_SLICES  0xA4u
-#define GX2CB_AA_BUFFER       0xA8u
-#define GX2CB_AA_SIZE         0xACu
-// regs[5] at 0xB0
-#define GX2CB_SIZEOF          0xC4u
+#define GX2CB_VIEW_MIP        0x74u
+#define GX2CB_VIEW_FIRST_SLICE 0x78u
+#define GX2CB_VIEW_NUM_SLICES  0x7Cu
+#define GX2CB_AA_BUFFER       0x80u
+#define GX2CB_AA_SIZE         0x84u
+#define GX2CB_REGS            0x88u  // 5 words
+#define GX2CB_SIZEOF          0x9Cu
 
 // ---------------------------------------------------------------------------
-// GX2DepthBuffer field offsets (size: 0xC8 bytes)
+// GX2DepthBuffer field offsets (size: 0xAC bytes)
 // ---------------------------------------------------------------------------
 #define GX2DB_SURFACE         0x00u  // GX2Surface embedded
-#define GX2DB_VIEW_MIP        0x9Cu
-#define GX2DB_VIEW_FIRST_SLICE 0xA0u
-#define GX2DB_VIEW_NUM_SLICES  0xA4u
-#define GX2DB_HIZ_PTR         0xA8u
-#define GX2DB_HIZ_SIZE        0xACu
-#define GX2DB_DEPTH_CLEAR     0xB0u  // f32 big-endian
-#define GX2DB_STENCIL_CLEAR   0xB4u  // uint8
-// regs[7] at 0xB8
-#define GX2DB_SIZEOF          0xC8u
+#define GX2DB_VIEW_MIP        0x74u
+#define GX2DB_VIEW_FIRST_SLICE 0x78u
+#define GX2DB_VIEW_NUM_SLICES  0x7Cu
+#define GX2DB_HIZ_PTR         0x80u
+#define GX2DB_HIZ_SIZE        0x84u
+#define GX2DB_DEPTH_CLEAR     0x88u  // f32 big-endian
+#define GX2DB_STENCIL_CLEAR   0x8Cu  // uint32
+#define GX2DB_REGS            0x90u  // 7 words
+#define GX2DB_SIZEOF          0xACu
 
 // ---------------------------------------------------------------------------
-// GX2Texture field offsets (size: 0xC4 bytes)
+// GX2Texture field offsets (size: 0x9C bytes)
 // ---------------------------------------------------------------------------
 #define GX2TEX_SURFACE        0x00u  // GX2Surface embedded
-#define GX2TEX_VIEW_MIP       0x9Cu
-#define GX2TEX_VIEW_NUM_MIPS  0xA0u
-#define GX2TEX_VIEW_FIRST_SLICE 0xA4u
-#define GX2TEX_VIEW_NUM_SLICES 0xA8u
-#define GX2TEX_COMP_MAP       0xACu  // component swizzle
-// regs[5] at 0xB0
-#define GX2TEX_SIZEOF         0xC4u
+#define GX2TEX_VIEW_MIP       0x74u
+#define GX2TEX_VIEW_NUM_MIPS  0x78u
+#define GX2TEX_VIEW_FIRST_SLICE 0x7Cu
+#define GX2TEX_VIEW_NUM_SLICES 0x80u
+#define GX2TEX_COMP_MAP       0x84u  // component swizzle
+#define GX2TEX_REGS           0x88u  // resource words 0,1,4,5,6
+#define GX2TEX_SIZEOF         0x9Cu
 
 // ---------------------------------------------------------------------------
 // GX2SurfaceFormat enum (subset — value stored at GX2SURF_FORMAT)
@@ -79,21 +80,21 @@
 #define GX2FMT_UNORM_BC3              0x0033u  // DXT5
 #define GX2FMT_UNORM_BC4              0x0034u
 #define GX2FMT_UNORM_BC5              0x0035u
-#define GX2FMT_FLOAT_D32              0x0806u  // depth only
+#define GX2FMT_FLOAT_D32              0x080Eu  // FLOAT_R32 used as a depth surface
 #define GX2FMT_FLOAT_D24_S8           0x0811u  // depth + stencil (most common)
 #define GX2FMT_FLOAT_R11_G11_B10      0x0816u
-#define GX2FMT_FLOAT_R16              0x080Fu
-#define GX2FMT_FLOAT_R16_G16          0x081Fu
-#define GX2FMT_FLOAT_R16_G16_B16_A16  0x0821u
+#define GX2FMT_FLOAT_R16              0x0806u
+#define GX2FMT_FLOAT_R16_G16          0x0810u
+#define GX2FMT_FLOAT_R16_G16_B16_A16  0x0820u
 #define GX2FMT_FLOAT_R32              0x080Eu
-#define GX2FMT_FLOAT_R32_G32          0x0822u
+#define GX2FMT_FLOAT_R32_G32          0x081Eu
 #define GX2FMT_FLOAT_R32_G32_B32_A32  0x0823u
 
 // ---------------------------------------------------------------------------
 // GX2SurfaceDim enum
 // ---------------------------------------------------------------------------
 #define GX2_SURFACE_DIM_TEXTURE_2D    0x01u
-#define GX2_SURFACE_DIM_TEXTURE_CUBE  0x08u
+#define GX2_SURFACE_DIM_TEXTURE_CUBE  0x03u
 
 // ---------------------------------------------------------------------------
 // GX2TileMode enum

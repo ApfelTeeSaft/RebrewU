@@ -8,10 +8,60 @@ using namespace ir;
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Architectural integer CR writes also copy XER.SO. Keep this separate from
+// IR comparison temporaries, whose LT/GT/EQ bits serve arithmetic predicates.
+static void emit_cr_so(VReg field, IRBuilder& b, uint32_t ga) {
+    VReg so = b.create_move(VReg::xer(), ga);
+    b.emit(Opcode::Shr, so, {reg(so), imm(31)}, ga);
+    b.emit(Opcode::Or, field, {reg(field), reg(so)}, ga);
+}
+
 // Emit a CR0 update after an Rc=1 instruction (result already in `res`).
 static void emit_rc(VReg res, IRBuilder& b, uint32_t ga) {
     b.emit(Opcode::CmpSigned, VReg::cr(0),
            {reg(res), imm(0)}, ga);
+    emit_cr_so(VReg::cr(0), b, ga);
+}
+
+// All carrying arithmetic is a 32-bit addition of two terms plus 0/1.
+// Subtract-from uses the one's complement of RA. Keep intermediate values
+// until CA and the result are ready, including when RT aliases RA or RB.
+static void emit_carry_sum(const Instruction& insn, IRBuilder& b, IRFunction& f,
+                           IROperand lhs, IROperand rhs, bool complement,
+                           bool carry_in, uint32_t fixed_carry = 0) {
+    const uint32_t ga = insn.addr;
+    auto temp = [&](Opcode op, std::vector<IROperand> args) {
+        VReg value = f.alloc_temp(); b.emit(op, value, std::move(args), ga); return value;
+    };
+    VReg a = temp(complement ? Opcode::Not : Opcode::Move, {lhs});
+    VReg c = carry_in
+        ? temp(Opcode::And, {reg(temp(Opcode::Shr, {reg(VReg::xer()), imm(29)})), imm(1)})
+        : temp(Opcode::Move, {imm(fixed_carry)});
+    VReg sum = b.create_add(reg(a), rhs, ga);
+    VReg result = b.create_add(reg(sum), reg(c), ga);
+    VReg overflow1 = temp(Opcode::CmpUnsigned, {reg(sum), reg(a)});
+    VReg overflow2 = temp(Opcode::CmpUnsigned, {reg(result), reg(sum)});
+    VReg ca = temp(Opcode::And, {reg(temp(Opcode::Or, {reg(overflow1), reg(overflow2)})), imm(8)});
+    ca = temp(Opcode::Shl, {reg(ca), imm(26)}); // CR.LT bit 3 -> XER.CA bit 29
+    VReg xer = temp(Opcode::And, {reg(VReg::xer()), imm(~0x20000000u)});
+    xer = temp(Opcode::Or, {reg(xer), reg(ca)});
+    const bool xo_form = (insn.word >> 26) == 31;
+    if (xo_form && insn.oe) {
+        VReg same_sign = temp(Opcode::Not, {reg(temp(Opcode::Xor, {reg(a), rhs}))});
+        VReg changed_sign = temp(Opcode::Xor, {reg(a), reg(result)});
+        VReg ov = temp(Opcode::And, {reg(same_sign), reg(changed_sign)});
+        ov = temp(Opcode::Shr, {reg(ov), imm(31)});
+        xer = temp(Opcode::And, {reg(xer), imm(~0x40000000u)});
+        xer = temp(Opcode::Or, {reg(xer), reg(temp(Opcode::Shl, {reg(ov), imm(30)}))});
+        xer = temp(Opcode::Or, {reg(xer), reg(temp(Opcode::Shl, {reg(ov), imm(31)}))});
+    }
+    b.emit(Opcode::Move, VReg::xer(), {reg(xer)}, ga);
+    b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(result)}, ga);
+    if ((xo_form && insn.rc) || insn.mnemonic == Mnemonic::ADDIC_) {
+        emit_rc(VReg::gpr(insn.rD), b, ga);
+        VReg so = temp(Opcode::Shr, {reg(VReg::xer()), imm(31)});
+        b.emit(Opcode::Or, VReg::cr(0), {reg(VReg::cr(0)), reg(so)}, ga);
+    }
 }
 
 // Compute rlwinm mask from MB/ME fields (PPC rotate mask).
@@ -33,9 +83,27 @@ static uint32_t ppc_mask(uint32_t mb, uint32_t me) {
 // top-level dispatcher
 // ---------------------------------------------------------------------------
 
-bool lower_to_ir(const Instruction& insn,
+static bool lower_core(const Instruction& insn,
                  IRBuilder& builder,
                  IRFunction& func) {
+    // Paired singles and GQR moves run through runtime rbrew_ps (decaf
+    // semantics); unnamed opcode-4 forms stay unlowered.
+    if (insn.iclass == InstrClass::Paired) {
+        if (insn.mnemonic == Mnemonic::UNKNOWN) return false;
+        builder.emit_void(Opcode::PairedSingle, {imm(insn.word)}, insn.addr);
+        return true;
+    }
+    if (insn.mnemonic == Mnemonic::TW || insn.mnemonic == Mnemonic::TWI) {
+        builder.emit_void(Opcode::Trap, {imm(insn.word), imm(insn.addr)}, insn.addr);
+        return true;
+    }
+    if (insn.mnemonic == Mnemonic::MTSPR || insn.mnemonic == Mnemonic::MFSPR) {
+        const uint32_t spr = ((insn.word >> 16) & 31u) | (((insn.word >> 11) & 31u) << 5);
+        if ((spr >= 912 && spr <= 919) || (spr >= 896 && spr <= 903)) {
+            builder.emit_void(Opcode::PairedSingle, {imm(insn.word)}, insn.addr);
+            return true;
+        }
+    }
     // Route compare mnemonics regardless of iclass
     switch (insn.mnemonic) {
     case Mnemonic::CMP: case Mnemonic::CMPI:
@@ -51,7 +119,40 @@ bool lower_to_ir(const Instruction& insn,
     case InstrClass::Float:    return lower_float(insn, builder, func);
     case InstrClass::Load:     return lower_load(insn, builder, func);
     case InstrClass::Store:    return lower_store(insn, builder, func);
+    case InstrClass::LoadMultiple:
+    case InstrClass::StoreMultiple: {
+        // Only D-form multiple-word transfers belong in this path.
+        if ((insn.word >> 26) != 46 && (insn.word >> 26) != 47) return false;
+        // LMW/STMW transfer consecutive 32-bit registers through r31.
+        // Snapshot EA before loading any register that could alias rA.
+        VReg base = builder.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u),
+            imm(static_cast<uint32_t>(insn.imm)), insn.addr);
+        for (uint32_t r = insn.rD; r < 32; ++r) {
+            VReg ea = builder.create_add(reg(base), imm((r - insn.rD) * 4u), insn.addr);
+            if (insn.iclass == InstrClass::LoadMultiple)
+                builder.emit(Opcode::Load32, VReg::gpr(r), {reg(ea)}, insn.addr);
+            else
+                builder.create_store32(reg(VReg::gpr(r)), reg(ea), insn.addr);
+        }
+        return true;
+    }
     case InstrClass::Branch:   return lower_branch(insn, builder, func);
+    case InstrClass::CacheControl:
+        if (insn.mnemonic == Mnemonic::DCBZ) {
+            // dcbz zeroes the 32-byte block containing (rA|0) + rB.
+            VReg ea = builder.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u),
+                                         reg(VReg::gpr(insn.rB)), insn.addr);
+            VReg line = func.alloc_temp();
+            builder.emit(Opcode::And, line, {reg(ea), imm(~31u)}, insn.addr);
+            for (uint32_t off = 0; off < 32; off += 4) {
+                VReg at = builder.create_add(reg(line), imm(off), insn.addr);
+                builder.emit_void(Opcode::Store32, {imm(0u), reg(at)}, insn.addr);
+            }
+            return true;
+        }
+        // Other cache maintenance has no effect on the host's coherent memory.
+        builder.create_nop(insn.addr);
+        return true;
     default:
         builder.create_nop(insn.addr);
         return true;
@@ -107,11 +208,8 @@ bool lower_integer(const Instruction& insn, IRBuilder& b, IRFunction& f) {
         return true;
 
     case Mnemonic::ADDIC: case Mnemonic::ADDIC_: {
-        b.emit(Opcode::Add, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA)), imm(static_cast<uint32_t>(insn.imm))}, ga);
-        // TODO: update XER.CA
-        if (insn.mnemonic == Mnemonic::ADDIC_)
-            emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)),
+                       imm(static_cast<uint32_t>(insn.imm)), false, false);
         return true;
     }
 
@@ -124,35 +222,25 @@ bool lower_integer(const Instruction& insn, IRBuilder& b, IRFunction& f) {
 
     case Mnemonic::ADDC: case Mnemonic::ADDC_:
     case Mnemonic::ADDCO: case Mnemonic::ADDCO_:
-        b.emit(Opcode::Add, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA)), reg(VReg::gpr(insn.rB))}, ga);
-        // TODO: XER.CA
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)),
+                       reg(VReg::gpr(insn.rB)), false, false);
         return true;
 
     case Mnemonic::ADDE: case Mnemonic::ADDE_:
     case Mnemonic::ADDEO: case Mnemonic::ADDEO_: {
-        // rD = rA + rB + XER.CA (simplified: ignore carry-in)
-        b.emit(Opcode::Add, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA)), reg(VReg::gpr(insn.rB))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)),
+                       reg(VReg::gpr(insn.rB)), false, true);
         return true;
     }
 
     case Mnemonic::ADDME: case Mnemonic::ADDME_:
     case Mnemonic::ADDMEO: case Mnemonic::ADDMEO_:
-        // rD = rA + XER.CA - 1  (simplified: rD = rA - 1)
-        b.emit(Opcode::Add, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA)), imm(~0u)}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)), imm(~0u), false, true);
         return true;
 
     case Mnemonic::ADDZE: case Mnemonic::ADDZE_:
     case Mnemonic::ADDZEO: case Mnemonic::ADDZEO_:
-        // rD = rA + XER.CA (simplified: rD = rA)
-        b.emit(Opcode::Move, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)), imm(0), false, true);
         return true;
 
     // ---- Sub ----
@@ -165,38 +253,30 @@ bool lower_integer(const Instruction& insn, IRBuilder& b, IRFunction& f) {
         return true;
 
     case Mnemonic::SUBFIC:
-        b.emit(Opcode::Sub, VReg::gpr(insn.rD),
-               {imm(static_cast<uint32_t>(insn.imm)), reg(VReg::gpr(insn.rA))}, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)),
+                       imm(static_cast<uint32_t>(insn.imm)), true, false, 1);
         return true;
 
     case Mnemonic::SUBFC: case Mnemonic::SUBFC_:
     case Mnemonic::SUBFCO: case Mnemonic::SUBFCO_:
-        b.emit(Opcode::Sub, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rB)), reg(VReg::gpr(insn.rA))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)),
+                       reg(VReg::gpr(insn.rB)), true, false, 1);
         return true;
 
     case Mnemonic::SUBFE: case Mnemonic::SUBFE_:
     case Mnemonic::SUBFEO: case Mnemonic::SUBFEO_:
-        b.emit(Opcode::Sub, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rB)), reg(VReg::gpr(insn.rA))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)),
+                       reg(VReg::gpr(insn.rB)), true, true);
         return true;
 
     case Mnemonic::SUBFME: case Mnemonic::SUBFME_:
     case Mnemonic::SUBFMEO: case Mnemonic::SUBFMEO_:
-        // rD = ~rA + XER.CA - 1 (simplified: ~rA)
-        b.emit(Opcode::Not, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)), imm(~0u), true, true);
         return true;
 
     case Mnemonic::SUBFZE: case Mnemonic::SUBFZE_:
     case Mnemonic::SUBFZEO: case Mnemonic::SUBFZEO_:
-        // rD = ~rA + XER.CA (simplified: ~rA)
-        b.emit(Opcode::Not, VReg::gpr(insn.rD),
-               {reg(VReg::gpr(insn.rA))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rD), b, ga);
+        emit_carry_sum(insn, b, f, reg(VReg::gpr(insn.rA)), imm(0), true, true);
         return true;
 
     // ---- Neg ----
@@ -388,15 +468,31 @@ bool lower_integer(const Instruction& insn, IRBuilder& b, IRFunction& f) {
         b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(VReg::xer())}, ga);
         return true;
 
-    case Mnemonic::MFCR:
-        // Simplified: move CR0 into rD
-        b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(VReg::cr(0))}, ga);
+    case Mnemonic::MFCR: {
+        // rD = CR0..CR7 as nibbles, CR0 in the most significant (LT GT EQ SO).
+        VReg acc = f.alloc_temp();
+        b.emit(Opcode::Move, acc, {imm(0u)}, ga);
+        for (uint32_t i = 0; i < 8; ++i) {
+            VReg field = f.alloc_temp(), shifted = f.alloc_temp();
+            b.emit(Opcode::And, field, {reg(VReg::cr(i)), imm(0xFu)}, ga);
+            b.emit(Opcode::Shl, shifted, {reg(field), imm(28u - 4u * i)}, ga);
+            b.emit(Opcode::Or, acc, {reg(acc), reg(shifted)}, ga);
+        }
+        b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(acc)}, ga);
         return true;
+    }
 
-    case Mnemonic::MTCRF:
-        // Simplified: update CR0
-        b.emit(Opcode::Move, VReg::cr(0), {reg(VReg::gpr(insn.rD))}, ga);
+    case Mnemonic::MTCRF: {
+        // Update each CR field selected by FXM (bit 0x80 = CR0) from rS.
+        const uint32_t fxm = (insn.word >> 12) & 0xFFu;
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (!(fxm & (0x80u >> i))) continue;
+            VReg shifted = f.alloc_temp();
+            b.emit(Opcode::Shr, shifted, {reg(VReg::gpr(insn.rD)), imm(28u - 4u * i)}, ga);
+            b.emit(Opcode::And, VReg::cr(i), {reg(shifted), imm(0xFu)}, ga);
+        }
         return true;
+    }
 
     default:
         b.create_nop(ga);
@@ -416,21 +512,25 @@ bool lower_compare(const Instruction& insn, IRBuilder& b, IRFunction& /*f*/) {
     case Mnemonic::CMP:
         b.emit(Opcode::CmpSigned, VReg::cr(crf),
                {reg(VReg::gpr(insn.rA)), reg(VReg::gpr(insn.rB))}, ga);
+        emit_cr_so(VReg::cr(crf), b, ga);
         return true;
 
     case Mnemonic::CMPI:
         b.emit(Opcode::CmpSigned, VReg::cr(crf),
                {reg(VReg::gpr(insn.rA)), imm(static_cast<uint32_t>(insn.imm))}, ga);
+        emit_cr_so(VReg::cr(crf), b, ga);
         return true;
 
     case Mnemonic::CMPL:
         b.emit(Opcode::CmpUnsigned, VReg::cr(crf),
                {reg(VReg::gpr(insn.rA)), reg(VReg::gpr(insn.rB))}, ga);
+        emit_cr_so(VReg::cr(crf), b, ga);
         return true;
 
     case Mnemonic::CMPLI:
         b.emit(Opcode::CmpUnsigned, VReg::cr(crf),
                {reg(VReg::gpr(insn.rA)), imm(insn.uimm)}, ga);
+        emit_cr_so(VReg::cr(crf), b, ga);
         return true;
 
     case Mnemonic::FCMPU:
@@ -459,6 +559,9 @@ bool lower_spr(const Instruction& insn, IRBuilder& b, IRFunction& f) {
 
 bool lower_rotate(const Instruction& insn, IRBuilder& b, IRFunction& f) {
     const uint32_t ga = insn.addr;
+    auto temp = [&](Opcode op, std::vector<IROperand> args) {
+        VReg value = f.alloc_temp(); b.emit(op, value, std::move(args), ga); return value;
+    };
     switch (insn.mnemonic) {
 
     // ---- rlwinm: rA = rotl(rS, sh) & mask(mb, me) ----
@@ -494,33 +597,49 @@ bool lower_rotate(const Instruction& insn, IRBuilder& b, IRFunction& f) {
         if (insn.rc) emit_rc(VReg::gpr(insn.rA), b, ga);
         return true;
 
-    // ---- Logical shifts ----
+    // ---- Logical shifts: amount is rB[26:31]; 32..63 shift every bit out ----
     case Mnemonic::SLW: case Mnemonic::SLW_:
-        b.emit(Opcode::Shl, VReg::gpr(insn.rA),
-               {reg(VReg::gpr(insn.rD)), reg(VReg::gpr(insn.rB))}, ga);
+    case Mnemonic::SRW: case Mnemonic::SRW_: {
+        const bool left = insn.mnemonic == Mnemonic::SLW || insn.mnemonic == Mnemonic::SLW_;
+        VReg amount = temp(Opcode::And, {reg(VReg::gpr(insn.rB)), imm(63)});
+        VReg shifted = temp(left ? Opcode::Shl : Opcode::Shr, {reg(VReg::gpr(insn.rD)), reg(amount)});
+        // keep = 0xFFFFFFFF when amount < 32, else 0 (amount bit 5 clear).
+        VReg keep = temp(Opcode::Sub, {reg(temp(Opcode::And,
+            {reg(temp(Opcode::Shr, {reg(amount), imm(5)})), imm(1)})), imm(1)});
+        b.emit(Opcode::And, VReg::gpr(insn.rA), {reg(shifted), reg(keep)}, ga);
         if (insn.rc) emit_rc(VReg::gpr(insn.rA), b, ga);
         return true;
+    }
 
-    case Mnemonic::SRW: case Mnemonic::SRW_:
-        b.emit(Opcode::Shr, VReg::gpr(insn.rA),
-               {reg(VReg::gpr(insn.rD)), reg(VReg::gpr(insn.rB))}, ga);
-        if (insn.rc) emit_rc(VReg::gpr(insn.rA), b, ga);
-        return true;
-
-    // ---- Arithmetic right shift ----
+    // ---- Algebraic right shift: CA = RS negative and a 1 bit shifted out ----
     case Mnemonic::SRAW: case Mnemonic::SRAW_:
-        b.emit(Opcode::Sar, VReg::gpr(insn.rA),
-               {reg(VReg::gpr(insn.rD)), reg(VReg::gpr(insn.rB))}, ga);
-        // TODO: XER.CA
+    case Mnemonic::SRAWI: case Mnemonic::SRAWI_: {
+        const bool immediate = insn.mnemonic == Mnemonic::SRAWI || insn.mnemonic == Mnemonic::SRAWI_;
+        // Capture RS and the amount before RA is written (RA may alias them).
+        VReg source = temp(Opcode::Move, {reg(VReg::gpr(insn.rD))});
+        VReg amount = immediate ? temp(Opcode::Move, {imm(insn.sh & 31u)})
+                                : temp(Opcode::And, {reg(VReg::gpr(insn.rB)), imm(63)});
+        VReg sign = temp(Opcode::Sar, {reg(source), imm(31)});           // 0 or ~0
+        VReg wide = temp(Opcode::And, {reg(temp(Opcode::Shr, {reg(amount), imm(5)})), imm(1)});
+        VReg narrow_mask = temp(Opcode::Sub, {reg(wide), imm(1)});      // ~0 if amount < 32
+        VReg shifted = temp(Opcode::Sar, {reg(source), reg(amount)});    // uses amount & 31
+        VReg result = temp(Opcode::Or, {reg(temp(Opcode::And, {reg(shifted), reg(narrow_mask)})),
+            reg(temp(Opcode::And, {reg(sign), reg(temp(Opcode::Not, {reg(narrow_mask)}))}))});
+        // Bits lost below the shift: (1 << n) - 1 for n < 32, all bits otherwise.
+        VReg low_mask = temp(Opcode::Sub, {reg(temp(Opcode::Shl, {imm(1), reg(amount)})), imm(1)});
+        low_mask = temp(Opcode::Or, {reg(low_mask), reg(temp(Opcode::Not, {reg(narrow_mask)}))});
+        VReg lost = temp(Opcode::And, {reg(source), reg(low_mask)});
+        // CmpUnsigned(lost, 0) has GT (bit 2) exactly when lost != 0.
+        VReg any_lost = temp(Opcode::And, {reg(temp(Opcode::Shr,
+            {reg(temp(Opcode::CmpUnsigned, {reg(lost), imm(0)})), imm(2)})), imm(1)});
+        VReg ca = temp(Opcode::And, {reg(any_lost), reg(temp(Opcode::Shr, {reg(source), imm(31)}))});
+        VReg xer = temp(Opcode::And, {reg(VReg::xer()), imm(~0x20000000u)});
+        b.emit(Opcode::Move, VReg::xer(),
+               {reg(temp(Opcode::Or, {reg(xer), reg(temp(Opcode::Shl, {reg(ca), imm(29)}))}))}, ga);
+        b.emit(Opcode::Move, VReg::gpr(insn.rA), {reg(result)}, ga);
         if (insn.rc) emit_rc(VReg::gpr(insn.rA), b, ga);
         return true;
-
-    case Mnemonic::SRAWI: case Mnemonic::SRAWI_:
-        b.emit(Opcode::Sar, VReg::gpr(insn.rA),
-               {reg(VReg::gpr(insn.rD)), imm(insn.sh)}, ga);
-        // TODO: XER.CA
-        if (insn.rc) emit_rc(VReg::gpr(insn.rA), b, ga);
-        return true;
+    }
 
     default:
         b.create_nop(ga);
@@ -616,7 +735,13 @@ bool lower_float(const Instruction& insn, IRBuilder& b, IRFunction& f) {
                {reg(VReg::fpr(insn.rB))}, ga);
         return true;
 
-    case Mnemonic::FCTIW: case Mnemonic::FCTIWZ:
+    case Mnemonic::FCTIWZ:
+        b.emit(Opcode::FCvtToIntZero, VReg::fpr(insn.rD),
+               {reg(VReg::fpr(insn.rB)), imm(insn.rc ? 1u : 0u)}, ga);
+        return true;
+
+    case Mnemonic::FCTIW:
+        // RN-controlled FCTIW remains a separate incomplete semantics class.
         b.emit(Opcode::FCvtToInt, VReg::fpr(insn.rD),
                {reg(VReg::fpr(insn.rB))}, ga);
         return true;
@@ -641,11 +766,13 @@ bool lower_float(const Instruction& insn, IRBuilder& b, IRFunction& f) {
     }
 
     case Mnemonic::FSEL: {
-        // fD = (fA >= 0.0) ? fC : fB — emit as rbrew_fsel runtime helper
-        // Simplified: use FCvtFromInt(0) as zero to compare against
-        // Represented as a no-op that preserves existing value for now.
-        // Full implementation would need a Select opcode; emit nop + comment.
-        b.create_nop(ga);
+        // Rc requires CR1 from FPSCR, which this runtime does not yet model.
+        // Keep that form visibly unsupported in the audit rather than claim
+        // full semantics from the ordinary nonrecord value-selection rule.
+        if (insn.rc) { b.create_nop(ga); return true; }
+        b.emit(Opcode::FSelect, VReg::fpr(insn.rD),
+               {reg(VReg::fpr(insn.rA)), reg(VReg::fpr(insn.rC)),
+                reg(VReg::fpr(insn.rB))}, ga);
         return true;
     }
 
@@ -659,15 +786,69 @@ bool lower_float(const Instruction& insn, IRBuilder& b, IRFunction& f) {
 // Memory loads
 // ---------------------------------------------------------------------------
 
+// Byte-reverse the low 16 bits (half) or the full word of v into a new temp.
+static VReg emit_byte_reverse(IRBuilder& b, IRFunction& f, VReg v, bool half, uint32_t ga) {
+    auto part = [&](uint32_t shift, bool left, uint32_t mask) {
+        VReg shifted = f.alloc_temp(), masked = f.alloc_temp();
+        b.emit(left ? Opcode::Shl : Opcode::Shr, shifted, {reg(v), imm(shift)}, ga);
+        b.emit(Opcode::And, masked, {reg(shifted), imm(mask)}, ga);
+        return masked;
+    };
+    VReg out = f.alloc_temp();
+    if (half) {
+        VReg lo = part(8, true, 0xFF00u), hi = part(8, false, 0x00FFu);
+        b.emit(Opcode::Or, out, {reg(lo), reg(hi)}, ga);
+        return out;
+    }
+    VReg a = part(24, false, 0x000000FFu), c = part(8, false, 0x0000FF00u);
+    VReg d = part(8, true, 0x00FF0000u), e = part(24, true, 0xFF000000u);
+    VReg ac = f.alloc_temp(), de = f.alloc_temp();
+    b.emit(Opcode::Or, ac, {reg(a), reg(c)}, ga);
+    b.emit(Opcode::Or, de, {reg(d), reg(e)}, ga);
+    b.emit(Opcode::Or, out, {reg(ac), reg(de)}, ga);
+    return out;
+}
+
 bool lower_load(const Instruction& insn, IRBuilder& b, IRFunction& f) {
     const uint32_t ga = insn.addr;
 
+    if (insn.mnemonic == Mnemonic::LWARX) {
+        VReg ea = b.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u),
+                              reg(VReg::gpr(insn.rB)), ga);
+        b.emit(Opcode::LoadReserve32, VReg::gpr(insn.rD), {reg(ea)}, ga);
+        return true;
+    }
+
+    if (insn.mnemonic == Mnemonic::LSWI) {
+        const uint32_t count = insn.rB ? insn.rB : 32u; // NB field
+        const uint32_t registers = (count + 3u) / 4u;
+        // These operand combinations are invalid in the architecture.
+        if (insn.rD == 0 && insn.rA == 0) return false;
+        for (uint32_t n = 0; n < registers; ++n)
+            if (insn.rA && ((insn.rD + n) & 31u) == insn.rA) return false;
+        VReg base = b.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u),
+                                imm(0u), ga);
+        for (uint32_t n = 0; n < count; ++n) {
+            VReg dst = VReg::gpr((insn.rD + n / 4u) & 31u);
+            if (n % 4u == 0) b.emit(Opcode::Move, dst, {imm(0u)}, ga);
+            VReg ea = b.create_add(reg(base), imm(n), ga);
+            VReg byte = f.alloc_temp();
+            b.emit(Opcode::Load8, byte, {reg(ea)}, ga);
+            VReg shifted = f.alloc_temp();
+            b.emit(Opcode::Shl, shifted, {reg(byte), imm(24u - (n % 4u) * 8u)}, ga);
+            b.emit(Opcode::Or, dst, {reg(dst), reg(shifted)}, ga);
+        }
+        return true;
+    }
+
     // Helper: compute effective address (base + offset or base + index)
+    // rA = 0 names the literal 0 (non-update forms), not r0.
+    auto base_a = [&]() { return insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u); };
     auto make_ea = [&](bool indexed) -> VReg {
         if (indexed)
-            return b.create_add(reg(VReg::gpr(insn.rA)), reg(VReg::gpr(insn.rB)), ga);
+            return b.create_add(base_a(), reg(VReg::gpr(insn.rB)), ga);
         else
-            return b.create_add(reg(VReg::gpr(insn.rA)),
+            return b.create_add(base_a(),
                                 imm(static_cast<uint32_t>(insn.imm)), ga);
     };
 
@@ -772,13 +953,15 @@ bool lower_load(const Instruction& insn, IRBuilder& b, IRFunction& f) {
 
     // ---- Byte-reversed (load + bswap — emit as regular load for now) ----
     case Mnemonic::LHBRX: {
-        VReg ea = make_ea(true);
-        b.emit(Opcode::Load16, VReg::gpr(insn.rD), {reg(ea)}, ga);
+        VReg ea = make_ea(true), raw = f.alloc_temp();
+        b.emit(Opcode::Load16, raw, {reg(ea)}, ga);
+        b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(emit_byte_reverse(b, f, raw, true, ga))}, ga);
         return true;
     }
     case Mnemonic::LWBRX: {
-        VReg ea = make_ea(true);
-        b.emit(Opcode::Load32, VReg::gpr(insn.rD), {reg(ea)}, ga);
+        VReg ea = make_ea(true), raw = f.alloc_temp();
+        b.emit(Opcode::Load32, raw, {reg(ea)}, ga);
+        b.emit(Opcode::Move, VReg::gpr(insn.rD), {reg(emit_byte_reverse(b, f, raw, false, ga))}, ga);
         return true;
     }
 
@@ -792,14 +975,44 @@ bool lower_load(const Instruction& insn, IRBuilder& b, IRFunction& f) {
 // Memory stores
 // ---------------------------------------------------------------------------
 
-bool lower_store(const Instruction& insn, IRBuilder& b, IRFunction& /*f*/) {
+bool lower_store(const Instruction& insn, IRBuilder& b, IRFunction& f) {
     const uint32_t ga = insn.addr;
 
+    if (insn.mnemonic == Mnemonic::STSWI) {
+        // Store NB bytes (0 = 32) from rS, rS+1, ... high byte first.
+        const uint32_t count = insn.rB ? insn.rB : 32u; // NB field
+        VReg base = b.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u), imm(0u), ga);
+        for (uint32_t n = 0; n < count; ++n) {
+            VReg src = VReg::gpr((insn.rD + n / 4u) & 31u);
+            VReg byte = f.alloc_temp();
+            b.emit(Opcode::Shr, byte, {reg(src), imm(24u - (n % 4u) * 8u)}, ga);
+            VReg ea = b.create_add(reg(base), imm(n), ga);
+            b.emit_void(Opcode::Store8, {reg(byte), reg(ea)}, ga);
+        }
+        return true;
+    }
+
+    if (insn.mnemonic == Mnemonic::STFIWX) {
+        VReg ea = b.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u),
+                              reg(VReg::gpr(insn.rB)), ga);
+        b.emit_void(Opcode::StoreFloatInteger32, {reg(VReg::fpr(insn.rD)), reg(ea)}, ga);
+        return true;
+    }
+
+    if (insn.mnemonic == Mnemonic::STWCX) {
+        VReg ea = b.create_add(insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u),
+                              reg(VReg::gpr(insn.rB)), ga);
+        b.emit_void(Opcode::StoreConditional32, {reg(VReg::gpr(insn.rD)), reg(ea)}, ga);
+        return true;
+    }
+
+    // rA = 0 names the literal 0 (non-update forms), not r0.
+    auto base_a = [&]() { return insn.rA ? reg(VReg::gpr(insn.rA)) : imm(0u); };
     auto make_ea = [&](bool indexed) -> VReg {
         if (indexed)
-            return b.create_add(reg(VReg::gpr(insn.rA)), reg(VReg::gpr(insn.rB)), ga);
+            return b.create_add(base_a(), reg(VReg::gpr(insn.rB)), ga);
         else
-            return b.create_add(reg(VReg::gpr(insn.rA)),
+            return b.create_add(base_a(),
                                 imm(static_cast<uint32_t>(insn.imm)), ga);
     };
 
@@ -888,12 +1101,14 @@ bool lower_store(const Instruction& insn, IRBuilder& b, IRFunction& /*f*/) {
     // ---- Byte-reversed ----
     case Mnemonic::STHBRX: {
         VReg ea = make_ea(true);
-        b.emit_void(Opcode::Store16, {reg(VReg::gpr(insn.rD)), reg(ea)}, ga);
+        VReg swapped = emit_byte_reverse(b, f, VReg::gpr(insn.rD), true, ga);
+        b.emit_void(Opcode::Store16, {reg(swapped), reg(ea)}, ga);
         return true;
     }
     case Mnemonic::STWBRX: {
         VReg ea = make_ea(true);
-        b.create_store32(reg(VReg::gpr(insn.rD)), reg(ea), ga);
+        VReg swapped = emit_byte_reverse(b, f, VReg::gpr(insn.rD), false, ga);
+        b.create_store32(reg(swapped), reg(ea), ga);
         return true;
     }
 
@@ -986,6 +1201,34 @@ bool lower_branch(const Instruction& insn, IRBuilder& b, IRFunction& f) {
     const bool cr_sense    = (insn.bo >> 3) & 1;
     const bool no_ctr_test = (insn.bo >> 2) & 1;
 
+    // A linked conditional branch is a call, not a conditional tail jump.
+    // CFG deliberately keeps its PC+4 continuation in the current block.
+    if (insn.lk) {
+        VReg taken = f.alloc_temp();
+        b.emit(Opcode::Move, taken, {imm(1u)}, ga);
+        if (!no_cr_test) {
+            VReg shifted = f.alloc_temp(), bit = f.alloc_temp();
+            b.emit(Opcode::Shr, shifted,
+                   {reg(VReg::cr(insn.bi / 4)), imm(3u - insn.bi % 4u)}, ga);
+            b.emit(Opcode::And, bit, {reg(shifted), imm(1u)}, ga);
+            if (!cr_sense)
+                b.emit(Opcode::Xor, bit, {reg(bit), imm(1u)}, ga);
+            b.emit(Opcode::And, taken, {reg(taken), reg(bit)}, ga);
+        }
+        if (!no_ctr_test) {
+            b.emit(Opcode::Sub, VReg::ctr(), {reg(VReg::ctr()), imm(1u)}, ga);
+            VReg cmp = f.alloc_temp(), shifted = f.alloc_temp(), bit = f.alloc_temp();
+            b.emit(Opcode::CmpUnsigned, cmp, {reg(VReg::ctr()), imm(0u)}, ga);
+            b.emit(Opcode::Shr, shifted, {reg(cmp), imm(2u)}, ga);
+            b.emit(Opcode::And, bit, {reg(shifted), imm(1u)}, ga);
+            if (insn.bo & 2u)
+                b.emit(Opcode::Xor, bit, {reg(bit), imm(1u)}, ga);
+            b.emit(Opcode::And, taken, {reg(taken), reg(bit)}, ga);
+        }
+        b.emit_void(Opcode::ConditionalCall, {reg(taken), imm(insn.target)}, ga);
+        return true;
+    }
+
     // Build condition VReg from CR[BI]
     VReg cond_bit;
     if (!no_cr_test) {
@@ -1040,6 +1283,22 @@ bool lower_branch(const Instruction& insn, IRBuilder& b, IRFunction& f) {
         b.emit_void(Opcode::Jump, {imm(insn.target)}, ga);
     }
 
+    return true;
+}
+
+bool lower_to_ir(const Instruction& insn, IRBuilder& builder, IRFunction& func) {
+    if (!lower_core(insn, builder, func)) return false;
+    // Espresso writes single-precision scalar results (and lfs loads) to both
+    // paired-single slots; double-precision ops and fmr leave ps1 alone.
+    switch (insn.mnemonic) {
+    case Mnemonic::LFS: case Mnemonic::LFSX: case Mnemonic::LFSU: case Mnemonic::LFSUX:
+    case Mnemonic::FADDS: case Mnemonic::FSUBS: case Mnemonic::FMULS: case Mnemonic::FDIVS:
+    case Mnemonic::FMADDS: case Mnemonic::FMSUBS: case Mnemonic::FNMADDS: case Mnemonic::FNMSUBS:
+    case Mnemonic::FRES: case Mnemonic::FRSP: case Mnemonic::FSQRTS:
+        builder.emit_void(Opcode::PairedFill, {imm(insn.rD)}, insn.addr);
+        break;
+    default: break;
+    }
     return true;
 }
 

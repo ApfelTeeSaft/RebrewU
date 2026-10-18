@@ -4,6 +4,8 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
+#include <set>
 
 namespace rebrewu::rpx {
 
@@ -39,8 +41,8 @@ std::optional<RpxModule> RpxLoader::load(std::span<const uint8_t> bytes,
     if (!decode_sections(*img, bytes, out)) return {};
     if (!decode_symbols(*img, out)) return {};
     if (!decode_exports(*img, out)) return {};
-    if (!decode_imports(*img, out)) return {};
     if (!decode_relocs(*img, out))  return {};
+    if (!decode_imports(*img, out)) return {};
 
     return out;
 }
@@ -184,27 +186,62 @@ bool RpxLoader::decode_exports(const elf::ElfImage& img, RpxModule& out) {
     return true;
 }
 
-bool RpxLoader::decode_imports(const elf::ElfImage& img, RpxModule& out) {
-    for (const auto& sec : img.sections) {
-        if (sec.header.type() != elf::SHT_RPL_IMPORTS) continue;
-        // Import section name is .fimport_<module>
-        std::string mod_name;
-        if (sec.name.size() > 9) // ".fimport_"
-            mod_name = sec.name.substr(9);
+std::optional<uint32_t> address_taken_import_slot(const RpxModule& m, size_t sym_index, uint32_t sym_address) {
+    // Address-taken function import with no call site (Gambit
+    // nn::boss::DataName ctor handed to an array constructor): the pre-linked
+    // lis/addi halves give its PLT slot. Only one consistent high and low
+    // half is accepted.
+    std::set<uint16_t> highs, lows;
+    for (const auto& rel : m.relocations) {
+        if (rel.sym_index != sym_index || rel.addend != 0 || (rel.offset & 1)) continue;
+        auto word = m.read_word(rel.offset & ~3u);
+        if (!word) continue;
+        const uint16_t half = (rel.offset & 2) ? uint16_t(*word) : uint16_t(*word >> 16);
+        if (rel.type == elf::R_PPC_ADDR16_HA) highs.insert(half);
+        else if (rel.type == elf::R_PPC_ADDR16_LO) lows.insert(half);
+    }
+    if (highs.size() != 1 || lows.size() != 1) return std::nullopt;
+    const uint32_t slot = (uint32_t(*highs.begin()) << 16) + uint32_t(int32_t(int16_t(*lows.begin())));
+    if (slot == sym_address) return std::nullopt;
+    return slot;
+}
 
-        if (sec.data.size() < 8) continue;
-        uint32_t count = elf::from_be(*reinterpret_cast<const uint32_t*>(sec.data.data()));
-        const uint8_t* p = sec.data.data() + 8;
-        for (uint32_t i = 0; i < count && (p + 12) <= sec.data.data() + sec.data.size(); ++i, p += 12) {
-            RpxImport imp;
-            imp.tls_offset   = elf::from_be(*reinterpret_cast<const uint32_t*>(p));
-            imp.stub_address = elf::from_be(*reinterpret_cast<const uint32_t*>(p + 4));
-            uint32_t name_off= elf::from_be(*reinterpret_cast<const uint32_t*>(p + 8));
-            if (name_off < sec.data.size())
-                imp.name = reinterpret_cast<const char*>(sec.data.data() + name_off);
-            imp.from_module = mod_name;
-            imp.is_data = (imp.tls_offset & 1) != 0;
-            imp.tls_offset &= ~1u;
+bool RpxLoader::decode_imports(const elf::ElfImage& img, RpxModule& out) {
+    // Import sections contain a module header and loader slots, not export
+    // records. Names come from symbols whose st_shndx names that section.
+    // Match REL24 call sites to the already-linked branch target, as done by
+    // tools/plt_resolver.py, to identify executable PLT thunks.
+    for (size_t si = 0; si < out.symbols.size(); ++si) {
+        const auto& sym = out.symbols[si];
+        if (sym.section_index >= img.sections.size() ||
+            sym.type == elf::STT_SECTION || sym.name.empty()) continue;
+        const auto& sec = img.sections[sym.section_index];
+        if (sec.header.type() != elf::SHT_RPL_IMPORTS) continue;
+        RpxImport base;
+        base.name = sym.name;
+        base.from_module = sec.name.substr(9);
+        base.is_data = sec.name.starts_with(".dimport_");
+        base.stub_address = sym.address;
+        std::vector<uint32_t> targets;
+        if (!base.is_data) {
+            for (const auto& rel : out.relocations) {
+                if (rel.sym_index != si || rel.type != elf::R_PPC_REL24) continue;
+                auto word = out.read_word(rel.offset);
+                if (!word || (*word >> 26) != 18) continue;
+                int32_t displacement = static_cast<int32_t>(*word & 0x03FFFFFCu);
+                if (displacement & 0x02000000) displacement |= static_cast<int32_t>(0xFC000000u);
+                uint32_t target = (*word & 2) ? static_cast<uint32_t>(displacement)
+                    : rel.offset + static_cast<uint32_t>(displacement);
+                if (std::find(targets.begin(), targets.end(), target) == targets.end())
+                    targets.push_back(target);
+            }
+        }
+        if (targets.empty() && !base.is_data)
+            if (auto slot = address_taken_import_slot(out, si, sym.address)) targets.push_back(*slot);
+        if (targets.empty()) out.imports.push_back(base);
+        else for (uint32_t target : targets) {
+            auto imp = base;
+            imp.stub_address = target;
             out.imports.push_back(std::move(imp));
         }
     }

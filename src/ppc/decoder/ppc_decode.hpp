@@ -109,14 +109,16 @@ enum class Mnemonic : uint16_t {
     LHA, LHAX, LHAU, LHAUX,
     LWZ, LWZX, LWZU, LWZUX,
     LHBRX, LWBRX,
-    LMW,
+    LMW, LSWI,
+    LWARX,
 
     // Memory: integer store
     STB, STBX, STBU, STBUX,
     STH, STHX, STHU, STHUX,
     STW, STWX, STWU, STWUX,
     STHBRX, STWBRX,
-    STMW,
+    STMW, STSWI,
+    STWCX,
 
     // Memory: float load / store
     LFS, LFSX, LFSU, LFSUX,
@@ -153,7 +155,7 @@ enum class Mnemonic : uint16_t {
     PS_MERGE00, PS_MERGE01, PS_MERGE10, PS_MERGE11,
     PS_MOV, PS_MUL, PS_MULS0, PS_MULS1,
     PS_NABS, PS_NEG, PS_NMADD, PS_NMADDS0, PS_NMADDS1,
-    PS_NMSUB, PS_NMSUBS0, PS_NMSUBS1,
+    PS_NMSUB, PS_NMSUBS0, PS_NMSUBS1, PS_MSUB,
     PS_RES, PS_RSQRTE, PS_SEL,
     PS_SUB, PS_SUM0, PS_SUM1,
     PSQ_L, PSQ_LU, PSQ_LX, PSQ_LUX,

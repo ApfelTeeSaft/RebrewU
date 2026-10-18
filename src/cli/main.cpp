@@ -1,3 +1,4 @@
+#include <fstream>
 #include "cli_options.hpp"
 #include "../core/rpx/rpx_loader.hpp"
 #include "../core/rpl/rpl_loader.hpp"
@@ -11,6 +12,7 @@
 #include "../diagnostics/diagnostics.hpp"
 #include <iostream>
 #include <cstdlib>
+#include "audit.hpp"
 
 using namespace rebrewu;
 
@@ -38,7 +40,21 @@ int main(int argc, char** argv) {
         }
         lnk.add_rpl(std::make_shared<rpl::RplModule>(std::move(*rpl_opt)));
     }
-    lnk.link(rpx);
+    // The host runtime replaces Cafe OS RPLs; inspection does not require them.
+    if (!opts->rpl_paths.empty() && !lnk.link(rpx)) return EXIT_FAILURE;
+
+    if (opts->command == cli::Command::Inspect) {
+        std::cout << "Module: " << rpx.name << "\nEntry point: 0x"
+                  << std::hex << rpx.entry_point << "\nSDA: 0x"
+                  << rpx.file_info.sda_base << "\nSDA2: 0x"
+                  << rpx.file_info.sda2_base << std::dec
+                  << "\nSections: " << rpx.sections.size()
+                  << "\nSymbols: " << rpx.symbols.size()
+                  << "\nImports: " << rpx.imports.size()
+                  << "\nExports: " << rpx.exports.size()
+                  << "\nRelocations: " << rpx.relocations.size() << "\n";
+        return EXIT_SUCCESS;
+    }
 
     if (opts->command == cli::Command::ListSymbols) {
         for (const auto& sym : rpx.symbols)
@@ -70,6 +86,22 @@ int main(int argc, char** argv) {
 
     // Function discovery
     analysis::FunctionDiscovery::Config disc_cfg;
+    AuditInventory audit;
+    if (opts->command==cli::Command::Audit) disc_cfg.frame_audit=[&](const auto& finding){audit.frame(finding);};
+    if (opts->command==cli::Command::Audit) disc_cfg.thunk_audit=[&](const auto& finding){audit.thunk(finding);};
+    // External analyzer function starts (e.g. Ghidra "NAME at ADDR" export):
+    // corroborating evidence only, combined with reference and separator proofs.
+    if (!opts->analyzer_entries_file.empty()) {
+        std::ifstream entries(opts->analyzer_entries_file);
+        if (!entries) { std::cerr << "cannot read analyzer entries " << opts->analyzer_entries_file << '\n'; return EXIT_FAILURE; }
+        for (std::string line; std::getline(entries, line);) {
+            const auto at = line.rfind(" at ");
+            const std::string hex = at == std::string::npos ? line : line.substr(at + 4);
+            if (hex.empty() || hex[0] == '#') continue;
+            try { disc_cfg.analyzer_entries.insert(uint32_t(std::stoul(hex, nullptr, 16))); } catch (...) {}
+        }
+        std::cerr << "Loaded " << disc_cfg.analyzer_entries.size() << " analyzer entries for corroboration\n";
+    }
     analysis::FunctionDiscovery disc(rpx, lnk, disc_cfg);
     // Manual hints: vtable entries that point to mflr-prolog functions
     // (the data-pointer scan finds the stwu at +4 but vtable uses the mflr at +0)
@@ -93,10 +125,33 @@ int main(int argc, char** argv) {
         }) {
         disc.add_hint({addr, {}, true});
     }
+    // Diagnostic inventory only: force every listed address as an entry so a
+    // single run can show which undiscovered targets startup really reaches.
+    if (!opts->hints_file.empty()) {
+        std::ifstream hints(opts->hints_file);
+        if (!hints) { std::cerr << "cannot read hints file " << opts->hints_file << '\n'; return EXIT_FAILURE; }
+        unsigned count = 0;
+        for (std::string line; std::getline(hints, line);) {
+            if (line.empty() || line[0] == '#') continue;
+            disc.add_hint({uint32_t(std::stoul(line, nullptr, 16)), {}, true});
+            ++count;
+        }
+        std::cerr << "Forced " << count << " diagnostic entry hints from " << opts->hints_file << '\n';
+    }
     auto boundaries = disc.discover();
 
     if (opts->verbose)
-        std::cerr << "Discovered " << boundaries.size() << " function candidates.\n";
+        std::cerr << "Discovered " << boundaries.size() << " function candidates.\n"
+                  << "Recognized " << disc.stats().pre_stack_prologues
+                  << " pre-stack LR-save prologues.\n"
+                  << "Recognized " << disc.stats().post_stack_prologues
+                  << " post-stack LR-save prologues with validated unwinds.\n"
+                  << "Added " << disc.stats().from_code_ptr_relocs
+                  << " isolated address-taken leaves from code relocations.\n"
+                  << "Added " << disc.stats().from_tail_callbacks
+                  << " relocation-backed conditional tail callbacks.\n"
+                  << "Added " << disc.stats().from_backward_leaf_thunks
+                  << " relocation-backed isolated backward leaf thunks.\n";
 
     analysis::CFGBuilder cfg_builder(rpx);
     ir::IRModule ir_module;
@@ -121,6 +176,17 @@ int main(int argc, char** argv) {
                   << built_fail << " failed).\n"
                   << "Entry point: 0x" << std::hex << rpx.entry_point << "\n";
 
+    if (opts->command == cli::Command::Audit) {
+        return audit.write(rpx, ir_module, cfg_builder, opts->output_dir) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    if (opts->command == cli::Command::Analyze) {
+        std::cout << "Discovered " << boundaries.size() << " function candidates.\n"
+                  << "Built " << built_ok << " functions (" << built_fail
+                  << " failed).\nEntry point: 0x" << std::hex << rpx.entry_point << "\n";
+        return EXIT_SUCCESS;
+    }
+
     for (const auto& sym : rpx.symbols) {
         if (sym.address != 0 && !sym.name.empty())
             ir_module.add_symbol(sym.address, sym.name);
@@ -143,7 +209,9 @@ int main(int argc, char** argv) {
     }
 
     codegen::NamingContext names(rpx.name);
-    codegen::CppEmitter emitter(ir_module, rpx, lnk, std::move(names));
+    codegen::EmitConfig emit_config;
+    emit_config.emit_ppc_image = opts->emit_ppc_image;
+    codegen::CppEmitter emitter(ir_module, rpx, lnk, std::move(names), emit_config);
     if (!emitter.emit(opts->output_dir)) {
         std::cerr << "Code generation failed: " << emitter.last_error() << "\n";
         return EXIT_FAILURE;

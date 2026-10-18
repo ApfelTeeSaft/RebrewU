@@ -14,17 +14,17 @@
 //
 // ElfReader validates and parses the on-disk ELF32 structure, byte-swaps all
 // header fields, and exposes sections/symbols/relocations for higher-level
-// loaders (rpx_loader, rpl_loader).  It does NOT decompress zlib-compressed
-// sections — that is the responsibility of the callers.
+// loaders (rpx_loader, rpl_loader). Compressed sections are decoded before
+// metadata is read; their size and compression flag are normalized in memory.
 // ============================================================================
 
 namespace rebrewu::elf {
 
-/// Raw (undecompressed) section data as seen inside the file.
+/// Decoded section data, preserving its original section index and address.
 struct RawSection {
     Elf32_Shdr header{};      // byte-swapped section header
     std::string name{};       // resolved from .shstrtab
-    std::vector<uint8_t> data{}; // raw section bytes (may be zlib-compressed)
+    std::vector<uint8_t> data{}; // decompressed section bytes
 };
 
 /// Result of loading and parsing an ELF file.

@@ -1,0 +1,15 @@
+LIBRARY splport_host
+EXPORTS
+    rbrew_launch
+    rbrew_runtime_abi
+    rbrew_overlay_accessible
+    rbrew_ps
+    rbrew_trap
+    rbrew_lwarx
+    rbrew_stwcx
+    rbrew_write_memory
+    rbrew_dispatch
+    rbrew_dispatch_linked
+    rbrew_call_indirect
+    rbrew_call
+    rbrew_register_func

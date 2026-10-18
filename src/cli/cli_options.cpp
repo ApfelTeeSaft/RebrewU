@@ -10,6 +10,7 @@ void print_usage(const char* prog) {
         "Usage: " << prog << " <command> [options]\n\n"
         "Commands:\n"
         "  recompile   Recompile an RPX to C++ (default)\n"
+        "  audit       Write read-only discovery/CFG/semantics JSON inventory\n"
         "  inspect     Inspect binary structure\n"
         "  symbols     List symbols\n"
         "  sections    List sections\n"
@@ -23,7 +24,9 @@ void print_usage(const char* prog) {
         "  -l <rpl>    Add RPL search path or file\n"
         "  -c <cfg>    Config file path\n"
         "  -v          Verbose output\n"
-        "  --no-color  Disable coloured output\n";
+        "  --no-color  Disable coloured output\n"
+        "  --emit-ppc-image  Emit relocated executable image for hybrid prototype\n"
+        "  --hints-file F    Diagnostic only: force extra entries (hex address per line)\n";
 }
 
 void print_version() {
@@ -47,6 +50,7 @@ std::optional<CliOptions> parse(int argc, char** argv) {
     else if (cmd == "exports")     { opts.command = Command::ListExports; ++i; }
     else if (cmd == "imports")     { opts.command = Command::ListImports; ++i; }
     else if (cmd == "disasm")      { opts.command = Command::Disassemble; ++i; }
+    else if (cmd == "audit")       { opts.command = Command::Audit; ++i; }
     else if (cmd == "analyze")     { opts.command = Command::Analyze;   ++i; }
     else if (cmd == "help")        { print_usage(argv[0]); return {}; }
     else if (cmd == "version")     { print_version(); return {}; }
@@ -60,12 +64,20 @@ std::optional<CliOptions> parse(int argc, char** argv) {
             opts.color = false;
         } else if (arg == "--no-codegen") {
             opts.no_codegen = true;
-        } else if (arg == "-o" && i + 1 < argc) {
+        } else if (arg == "--rpx" && i + 1 < argc) {
+            opts.rpx_path = argv[++i];
+        } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
             opts.output_dir = argv[++i];
         } else if (arg == "-l" && i + 1 < argc) {
             opts.rpl_paths.emplace_back(argv[++i]);
         } else if (arg == "-c" && i + 1 < argc) {
             opts.config_path = argv[++i];
+        } else if (arg == "--analyzer-entries" && i + 1 < argc) {
+            opts.analyzer_entries_file = argv[++i];
+        } else if (arg == "--hints-file" && i + 1 < argc) {
+            opts.hints_file = argv[++i];
+        } else if (arg == "--emit-ppc-image") {
+            opts.emit_ppc_image = true;
         } else if (arg.starts_with("-")) {
             std::cerr << "unknown option: " << arg << "\n";
             return {};

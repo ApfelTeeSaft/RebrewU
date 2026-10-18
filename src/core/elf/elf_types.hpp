@@ -551,7 +551,6 @@ static_assert(sizeof(Elf32_Rela) == 12, "Elf32_Rela must be 12 bytes");
 /// See rpx_types.hpp for a decoded representation with host-order fields.
 struct RplFileInfoRaw {
     Elf32_Word magic;              // Must be 0xCAFE0402
-    Elf32_Word unk0x04;
     Elf32_Word textSize;           // Total size of executable sections
     Elf32_Word textAlign;          // Alignment of text segments
     Elf32_Word dataSize;           // Total size of data sections
@@ -575,6 +574,7 @@ struct RplFileInfoRaw {
     Elf32_Word cafeSdkRevision;    // Cafe SDK revision
     Elf32_Half tlsModuleIndex;     // TLS module index
     Elf32_Half tlsAlignShift;      // TLS alignment shift
+    Elf32_Word runtimeFileInfoSize;
 
     // Convenience accessors with big-endian conversion
     [[nodiscard]] uint32_t get_magic()               const noexcept { return from_be(magic); }

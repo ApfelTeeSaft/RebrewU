@@ -1,3 +1,4 @@
+#include "../../runtime/rbrew_diagnostics.h"
 // nsysnet / nn_ac / nlibcurl
 //
 // Maps Wii U nsysnet functions to POSIX/BSD sockets so game network code
@@ -159,7 +160,7 @@ static void socket_lib_init(CPUState* cpu) {
     WSADATA wd;
     WSAStartup(MAKEWORD(2,2), &wd);
 #endif
-    fprintf(stderr, "[nsysnet] socket_lib_init\n");
+    RBREW_LOGF(stderr, "[nsysnet] socket_lib_init\n");
     RET = 0;
 }
 
@@ -228,7 +229,7 @@ static void getsockname_(CPUState* cpu) {
 static void send_(CPUState* cpu) {
     // ARG0=fd, ARG1=buf_guest_ptr, ARG2=len, ARG3=flags
     uint32_t len = ARG2;
-    if (!ARG1 || (uint64_t)ARG1 + len > WIIU_MEM_SIZE) { RET = (uint32_t)-1; return; }
+    if (!ARG1 || !rbrew_memory_accessible(MEM,ARG1,len)) { RET = (uint32_t)-1; return; }
     ssize_t n = send((int)ARG0, (const char*)(MEM + ARG1), (int)len, (int)ARG3);
     RET = (uint32_t)n;
 }
@@ -236,7 +237,7 @@ static void send_(CPUState* cpu) {
 static void recv_(CPUState* cpu) {
     // ARG0=fd, ARG1=buf_guest_ptr, ARG2=len, ARG3=flags
     uint32_t len = ARG2;
-    if (!ARG1 || (uint64_t)ARG1 + len > WIIU_MEM_SIZE) { RET = (uint32_t)-1; return; }
+    if (!ARG1 || !rbrew_memory_accessible(MEM,ARG1,len)) { RET = (uint32_t)-1; return; }
     ssize_t n = recv((int)ARG0, (char*)(MEM + ARG1), (int)len, (int)ARG3);
     RET = (uint32_t)n;
 }
@@ -244,7 +245,7 @@ static void recv_(CPUState* cpu) {
 static void sendto_(CPUState* cpu) {
     // ARG0=fd, ARG1=buf, ARG2=len, ARG3=flags, ARG4=dest_addr, ARG5=addrlen
     uint32_t len = ARG2;
-    if (!ARG1 || (uint64_t)ARG1 + len > WIIU_MEM_SIZE) { RET = (uint32_t)-1; return; }
+    if (!ARG1 || !rbrew_memory_accessible(MEM,ARG1,len)) { RET = (uint32_t)-1; return; }
     struct sockaddr_in sa;
     guest_to_host_sockaddr(MEM, ARG4, &sa);
     ssize_t n = sendto((int)ARG0, (const char*)(MEM + ARG1), (int)len, (int)ARG3,
@@ -255,7 +256,7 @@ static void sendto_(CPUState* cpu) {
 static void recvfrom_(CPUState* cpu) {
     // ARG0=fd, ARG1=buf, ARG2=len, ARG3=flags, ARG4=src_addr_out, ARG5=addrlen_out
     uint32_t len = ARG2;
-    if (!ARG1 || (uint64_t)ARG1 + len > WIIU_MEM_SIZE) { RET = (uint32_t)-1; return; }
+    if (!ARG1 || !rbrew_memory_accessible(MEM,ARG1,len)) { RET = (uint32_t)-1; return; }
     struct sockaddr_in sa;
     socklen_t slen = sizeof(sa);
     ssize_t n = recvfrom((int)ARG0, (char*)(MEM + ARG1), (int)len, (int)ARG3,
@@ -284,7 +285,7 @@ static void select_(CPUState* cpu) {
     fd_set efds = guest_to_fdset(MEM, ARG3);
 
     struct timeval tv, *tvp = nullptr;
-    if (ARG4 && (uint64_t)ARG4 + 8u <= WIIU_MEM_SIZE) {
+    if (ARG4 && rbrew_memory_accessible(MEM,ARG4,8u)) {
         tv.tv_sec  = (long)(int32_t)rbrew_read32(MEM, ARG4 + 0u);
         tv.tv_usec = (long)(int32_t)rbrew_read32(MEM, ARG4 + 4u);
         tvp = &tv;
@@ -318,7 +319,7 @@ static void setsockopt_(CPUState* cpu) {
     int hlevel = map_level(wlevel);
     int hopt   = (hlevel == SOL_SOCKET) ? map_so_option(wopt) : wopt;
 
-    if (!vp || vl == 0 || (uint64_t)vp + vl > WIIU_MEM_SIZE) { RET = 0; return; }
+    if (!vp || vl == 0 || !rbrew_memory_accessible(MEM,vp,vl)) { RET = 0; return; }
 
     // The optval is a 4-byte integer for most options (endian-swap from BE guest)
     int val_host = (int)rbrew_read32(MEM, vp);
@@ -356,7 +357,7 @@ static void inet_ntoa_(CPUState* cpu) {
 
     char buf[20];
     int len = snprintf(buf, sizeof(buf), "%u.%u.%u.%u", b0, b1, b2, b3);
-    if (len > 0 && gptr + (uint32_t)len + 1u <= WIIU_MEM_SIZE) {
+    if (len > 0 && rbrew_memory_accessible(MEM,gptr,uint64_t(len)+1u)) {
         memcpy(MEM + gptr, buf, (size_t)len + 1u);
         RET = gptr;
     } else {
@@ -381,7 +382,7 @@ static void inet_pton_(CPUState* cpu) {
 
     struct in_addr addr;
     int rc = inet_pton(AF_INET, buf, &addr);
-    if (rc == 1 && (uint64_t)ARG2 + 4u <= WIIU_MEM_SIZE) {
+    if (rc == 1 && rbrew_memory_accessible(MEM,ARG2,4u)) {
         memcpy(MEM + ARG2, &addr.s_addr, 4); // network-order bytes
     }
     RET = (uint32_t)rc; // 1=success, 0=invalid, -1=unsupported family
@@ -403,7 +404,7 @@ static void gethostbyname_(CPUState* cpu) {
 
     struct hostent* he = gethostbyname(hostname);
     if (!he || he->h_addrtype != AF_INET || !he->h_addr_list || !he->h_addr_list[0]) {
-        fprintf(stderr, "[nsysnet] gethostbyname(\"%s\"): failed\n", hostname);
+        RBREW_LOGF(stderr, "[nsysnet] gethostbyname(\"%s\"): failed\n", hostname);
         RET = 0;
         return;
     }
@@ -430,7 +431,7 @@ static void gethostbyname_(CPUState* cpu) {
     rbrew_write32(MEM, HE_BASE + 0x0Cu, 4u);               // h_length
     rbrew_write32(MEM, HE_BASE + 0x10u, HE_ADDRLIST_ARR);  // h_addr_list
 
-    fprintf(stderr, "[nsysnet] gethostbyname(\"%s\") → %u.%u.%u.%u\n",
+    RBREW_LOGF(stderr, "[nsysnet] gethostbyname(\"%s\") → %u.%u.%u.%u\n",
             hostname,
             MEM[HE_ADDR], MEM[HE_ADDR+1], MEM[HE_ADDR+2], MEM[HE_ADDR+3]);
 
@@ -486,7 +487,7 @@ static void getaddrinfo_(CPUState* cpu) {
                          *servname ? servname : nullptr,
                          &hints_h, &res);
     if (rc != 0 || !res) {
-        fprintf(stderr, "[nsysnet] getaddrinfo(\"%s\",\"%s\"): %s\n",
+        RBREW_LOGF(stderr, "[nsysnet] getaddrinfo(\"%s\",\"%s\"): %s\n",
                 hostname, servname, gai_strerror(rc));
         RET = (uint32_t)(rc ? rc : -1);
         return;
@@ -536,7 +537,7 @@ static void getaddrinfo_(CPUState* cpu) {
     // Write *res = first entry
     if (ARG3) rbrew_write32(MEM, ARG3, AI_BASE);
 
-    fprintf(stderr, "[nsysnet] getaddrinfo(\"%s\",\"%s\") → %u entr%s\n",
+    RBREW_LOGF(stderr, "[nsysnet] getaddrinfo(\"%s\",\"%s\") → %u entr%s\n",
             hostname, servname, count, count == 1 ? "y" : "ies");
     RET = 0;
 }
@@ -556,7 +557,7 @@ static void ac_GetAssignedSubnet(CPUState* cpu)        { if (ARG0) rbrew_write32
 
 // IsApplicationConnected(bool* result)  → *result = TRUE; return 0
 static void ac_IsApplicationConnected(CPUState* cpu) {
-    if (ARG0 && (uint64_t)ARG0 + 1u <= WIIU_MEM_SIZE)
+    if (ARG0 && rbrew_memory_accessible(MEM,ARG0,1u))
         MEM[ARG0] = 1u; // *result = true
     RET = 0;
 }

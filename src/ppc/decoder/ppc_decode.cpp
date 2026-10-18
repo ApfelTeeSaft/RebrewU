@@ -136,16 +136,28 @@ static Mnemonic decode_op31(uint32_t word, Instruction& out) noexcept {
     out.rB  = static_cast<uint8_t>(ppc_field(word, 16, 20));
     out.oe  = ppc_bit(word, 21) != 0;
     out.rc  = ppc_bit(word, 31) != 0;
-    uint32_t xop = ppc_field(word, 22, 30);
+    // X/XFX instructions use all ten extended-opcode bits. Only XO-form
+    // arithmetic treats bit 21 as OE rather than part of the opcode.
+    uint32_t xop = ppc_field(word, 21, 30);
+    out.oe = false;
+    switch (xop & 0x1FFu) {
+    case 8: case 10: case 40: case 104: case 136: case 138:
+    case 200: case 202: case 232: case 234: case 235: case 266:
+    case 459: case 491:
+        out.oe = ppc_bit(word, 21) != 0;
+        xop &= 0x1FFu;
+        break;
+    default: break;
+    }
 
     switch (xop) {
     case 0:   out.iclass = InstrClass::Integer; return Mnemonic::CMP;
     case 8:   return out.oe ? (out.rc ? Mnemonic::SUBFC_  : Mnemonic::SUBFC )
                             : (out.rc ? Mnemonic::SUBFC_  : Mnemonic::SUBFC );
     case 10:  return out.oe ? Mnemonic::ADDCO_ : Mnemonic::ADDC;
-    case 20:  out.iclass = InstrClass::Load; return Mnemonic::LWZX; // LWARX mapped to LWZX for now
+    case 20:  out.iclass = InstrClass::Load; return Mnemonic::LWARX;
     case 23:  out.iclass = InstrClass::Load;   return Mnemonic::LWZX;
-    case 24:  return out.rc ? Mnemonic::SLW_ : Mnemonic::SLW;
+    case 24:  out.iclass = InstrClass::Rotate; return out.rc ? Mnemonic::SLW_ : Mnemonic::SLW;
     case 26:  return out.rc ? Mnemonic::CNTLZW_ : Mnemonic::CNTLZW;
     case 28:  return out.rc ? Mnemonic::AND_ : Mnemonic::AND;
     case 32:  out.iclass = InstrClass::Integer; return Mnemonic::CMPL;
@@ -162,6 +174,7 @@ static Mnemonic decode_op31(uint32_t word, Instruction& out) noexcept {
     case 138: return out.oe ? Mnemonic::ADDEO_  : (out.rc ? Mnemonic::ADDE_  : Mnemonic::ADDE);
     case 144: out.iclass = InstrClass::Integer; return Mnemonic::MTCRF;
     case 146: out.iclass = InstrClass::System;  return Mnemonic::MTMSR;
+    case 150: out.iclass = InstrClass::Store;   return out.rc ? Mnemonic::STWCX : Mnemonic::UNKNOWN;
     case 151: out.iclass = InstrClass::Store;   return Mnemonic::STWX;
     case 183: out.iclass = InstrClass::Store;   return Mnemonic::STWUX;
     case 200: return out.oe ? Mnemonic::SUBFZEO_ : (out.rc ? Mnemonic::SUBFZE_ : Mnemonic::SUBFZE);
@@ -216,17 +229,18 @@ static Mnemonic decode_op31(uint32_t word, Instruction& out) noexcept {
     case 491: return out.oe ? Mnemonic::DIVWO_  : (out.rc ? Mnemonic::DIVW_  : Mnemonic::DIVW);
     case 512: out.iclass = InstrClass::Integer; return Mnemonic::MCRXR;
     case 535: out.iclass = InstrClass::Load;    return Mnemonic::LFSX;
-    case 536: return out.rc ? Mnemonic::SRW_ : Mnemonic::SRW;
+    case 536: out.iclass = InstrClass::Rotate; return out.rc ? Mnemonic::SRW_ : Mnemonic::SRW;
     case 567: out.iclass = InstrClass::Load;    return Mnemonic::LFSUX;
-    case 597: out.iclass = InstrClass::LoadMultiple; return Mnemonic::LMW; // LSWI mapped to LMW
+    case 597: out.iclass = InstrClass::Load;    return Mnemonic::LSWI;
     case 599: out.iclass = InstrClass::Load;    return Mnemonic::LFDX;
     case 631: out.iclass = InstrClass::Load;    return Mnemonic::LFDUX;
     case 663: out.iclass = InstrClass::Store;   return Mnemonic::STFSX;
     case 695: out.iclass = InstrClass::Store;   return Mnemonic::STFSUX;
     case 727: out.iclass = InstrClass::Store;   return Mnemonic::STFDX;
     case 759: out.iclass = InstrClass::Store;   return Mnemonic::STFDUX;
-    case 792: return out.rc ? Mnemonic::SRAW_ : Mnemonic::SRAW;
+    case 792: out.iclass = InstrClass::Rotate; return out.rc ? Mnemonic::SRAW_ : Mnemonic::SRAW;
     case 824: {
+        out.iclass = InstrClass::Rotate;
         out.sh = static_cast<uint8_t>(ppc_field(word, 16, 20));
         return out.rc ? Mnemonic::SRAWI_ : Mnemonic::SRAWI;
     }
@@ -236,6 +250,15 @@ static Mnemonic decode_op31(uint32_t word, Instruction& out) noexcept {
     case 982: out.iclass = InstrClass::CacheControl; return Mnemonic::ICBI;
     case 983: out.iclass = InstrClass::Store;   return Mnemonic::STFIWX;
     case 1014:out.iclass = InstrClass::CacheControl; return Mnemonic::DCBZ;
+    // Previously undecoded and silently lowered as nops (audit "semantics").
+    case 11:  return out.rc ? Mnemonic::MULHWU_ : Mnemonic::MULHWU;
+    case 19:  return Mnemonic::MFCR;
+    case 534: out.iclass = InstrClass::Load;    return Mnemonic::LWBRX;
+    case 662: out.iclass = InstrClass::Store;   return Mnemonic::STWBRX;
+    case 725: out.iclass = InstrClass::Store;   return Mnemonic::STSWI;
+    case 54:  out.iclass = InstrClass::CacheControl; return Mnemonic::DCBST;
+    case 86:  out.iclass = InstrClass::CacheControl; return Mnemonic::DCBF;
+    case 4:   out.iclass = InstrClass::System; return Mnemonic::TW;
     default:  return Mnemonic::UNKNOWN;
     }
 }
@@ -317,6 +340,61 @@ static Mnemonic decode_op63(uint32_t word, Instruction& out) noexcept {
     }
 }
 
+// Paired singles: opcode 4 (arithmetic, moves, compares, indexed psq) and
+// 56/57/60/61 (psq_l/lu/st/stu). Only forms runtime rbrew_ps implements are
+// named; anything else stays UNKNOWN.
+static Mnemonic decode_paired(uint32_t word, uint32_t op) noexcept {
+    switch (op) {
+    case 56: return Mnemonic::PSQ_L;
+    case 57: return Mnemonic::PSQ_LU;
+    case 60: return Mnemonic::PSQ_ST;
+    case 61: return Mnemonic::PSQ_STU;
+    default: break;
+    }
+    switch (ppc_field(word, 25, 30)) {
+    case 6:  return Mnemonic::PSQ_LX;
+    case 7:  return Mnemonic::PSQ_STX;
+    case 38: return Mnemonic::PSQ_LUX;
+    case 39: return Mnemonic::PSQ_STUX;
+    default: break;
+    }
+    switch (ppc_field(word, 26, 30)) {
+    case 10: return Mnemonic::PS_SUM0;
+    case 11: return Mnemonic::PS_SUM1;
+    case 12: return Mnemonic::PS_MULS0;
+    case 13: return Mnemonic::PS_MULS1;
+    case 14: return Mnemonic::PS_MADDS0;
+    case 15: return Mnemonic::PS_MADDS1;
+    case 18: return Mnemonic::PS_DIV;
+    case 20: return Mnemonic::PS_SUB;
+    case 21: return Mnemonic::PS_ADD;
+    case 23: return Mnemonic::PS_SEL;
+    case 24: return Mnemonic::PS_RES;
+    case 25: return Mnemonic::PS_MUL;
+    case 26: return Mnemonic::PS_RSQRTE;
+    case 28: return Mnemonic::PS_MSUB;
+    case 29: return Mnemonic::PS_MADD;
+    case 30: return Mnemonic::PS_NMSUB;
+    case 31: return Mnemonic::PS_NMADD;
+    default: break;
+    }
+    switch (ppc_field(word, 21, 30)) {
+    case 0:   return Mnemonic::PS_CMPU0;
+    case 32:  return Mnemonic::PS_CMPO0;
+    case 64:  return Mnemonic::PS_CMPU1;
+    case 96:  return Mnemonic::PS_CMPO1;
+    case 40:  return Mnemonic::PS_NEG;
+    case 72:  return Mnemonic::PS_MOV;
+    case 136: return Mnemonic::PS_NABS;
+    case 264: return Mnemonic::PS_ABS;
+    case 528: return Mnemonic::PS_MERGE00;
+    case 560: return Mnemonic::PS_MERGE01;
+    case 592: return Mnemonic::PS_MERGE10;
+    case 624: return Mnemonic::PS_MERGE11;
+    default:  return Mnemonic::UNKNOWN;
+    }
+}
+
 // ============================================================================
 // Public decode function
 // ============================================================================
@@ -346,6 +424,10 @@ std::optional<Instruction> decode(uint32_t word, uint32_t pc) noexcept {
     case 31: out.mnemonic = decode_op31(word, out); break;
     case 59: out.mnemonic = decode_op59(word, out); break;
     case 63: out.mnemonic = decode_op63(word, out); break;
+    case 4: case 56: case 57: case 60: case 61:
+        out.iclass = InstrClass::Paired;
+        out.mnemonic = decode_paired(word, op);
+        break;
     default:
         out.mnemonic = classify_primary(word, out);
         break;
